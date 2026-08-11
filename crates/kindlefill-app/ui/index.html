@@ -65,6 +65,7 @@
   }
   button:hover:not(:disabled) { border-color: var(--accent); }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
   button:disabled { opacity: .45; cursor: default; }
   .bar {
     height: 10px; background: var(--bg); border: 1px solid var(--line);
@@ -102,9 +103,9 @@
       <div class="note warn hidden" id="foreignwarn">
         <div id="foreigntext"></div>
         <ul class="names" id="foreignlist"></ul>
-        <label class="ack"><input type="checkbox" id="foreignack" /> Use this folder anyway</label>
+        <label class="ack"><input type="checkbox" id="overwrite" /> <span id="overwritelabel"></span></label>
       </div>
-      <div class="note bad hidden" id="updatewarn">
+      <div class="note hidden" id="updatewarn">
         <div id="updatetext"></div>
         <ul class="names" id="updatelist"></ul>
       </div>
@@ -164,11 +165,15 @@ function dirName() {
   return $('dirname').value.trim() || DEFAULT_DIR;
 }
 
-/// True when the folder holds something this tool didn't write and the user hasn't
-/// said to use it anyway. `clean` never touches those files — but a folder full of
-/// someone else's content is a sign we're about to move into the wrong room.
+/// True when the folder holds content this tool didn't write and overwriting hasn't
+/// been confirmed.
+///
+/// A folder holding only our own filler is deliberately not this case — that's a
+/// resume, and there is nothing there to lose. Warning about data loss when the data
+/// is our own filler would be false, and it would put a confirmation in front of the
+/// ordinary stop-and-continue path.
 function blockedByForeign() {
-  return !!(device && device.foreign.length && !$('foreignack').checked);
+  return !!(device && device.foreign.length && !$('overwrite').checked);
 }
 
 /// Mirrors Window::MIN_WIDTH in plan.rs. Checked here purely so the problem is visible
@@ -239,24 +244,28 @@ function renderDevice(d) {
   const foreign = d.foreign.length > 0;
   $('foreignwarn').classList.toggle('hidden', !foreign);
   if (foreign) {
+    const n = d.foreign.length;
     $('foreigntext').textContent =
-      `${d.fill_dir} holds ${d.foreign.length} item${d.foreign.length === 1 ? '' : 's'} ` +
-      `this tool didn't write. ${d.foreign.length === 1 ? 'It' : 'They'} and the folder will be ` +
-      `left in place. Use a different name, or confirm:`;
+      `${d.fill_dir} already exists and holds ${n} item${n === 1 ? '' : 's'} this tool ` +
+      `didn't write. Use a different folder name, or overwrite it:`;
+    $('overwritelabel').textContent =
+      `Overwrite ${d.fill_dir} — permanently deletes everything in it, listed above`;
     fillList($('foreignlist'), d.foreign);
-    // A fresh listing is a fresh decision; don't carry an old acknowledgement over.
-    $('foreignack').checked = false;
+    // A fresh listing is a fresh decision: never carry a tick across a re-detect, or a
+    // confirmation given for one folder's contents would apply to another's.
+    $('overwrite').checked = false;
+  } else {
+    $('overwrite').checked = false;
   }
 
-  // Filling around an update that's already downloaded accomplishes nothing — the
-  // bytes are on the device and it will install them at the next restart.
+  // Stated, not editorialized: it's the user's device and possibly their own file.
   const staged = d.updates.length > 0;
   $('updatewarn').classList.toggle('hidden', !staged);
   $('delupdates').classList.toggle('hidden', !staged);
   if (staged) {
-    $('updatetext').textContent =
-      `A firmware update is already downloaded. Filling around it accomplishes nothing — ` +
-      `the Kindle will install it at the next restart. Delete it first:`;
+    $('updatetext').textContent = staged && d.updates.length === 1
+      ? 'A downloaded firmware update is on the device:'
+      : 'Downloaded firmware updates are on the device:';
     fillList($('updatelist'), d.updates);
   }
 
@@ -265,10 +274,17 @@ function renderDevice(d) {
   estimate();
 }
 
+// Guarded rather than merely debounced. Disabling the buttons stops a *click* landing
+// mid-detect, but the folder-name field re-detects on its own timer, and a detect takes
+// longer than the debounce — so two could overlap and the second open would fail for
+// exclusive access. A detect requested during one is folded into a single re-run after.
+let detecting = false, detectAgain = false;
+
 async function refresh() {
-  // Fill and Remove Filler open the device themselves. Leaving them live while a
-  // detect is in flight lets a fast click land during it, and the second open fails
-  // for exclusive access — a confusing error for what looks like an idle app.
+  if (detecting) { detectAgain = true; return; }
+  detecting = true;
+  // Fill and Remove Filler open the device themselves, so they must not be live while
+  // a detect holds it.
   $('refresh').disabled = true;
   $('fill').disabled = true;
   $('clean').disabled = true;
@@ -284,6 +300,8 @@ async function refresh() {
     log(String(e));
   } finally {
     $('refresh').disabled = busy;
+    detecting = false;
+    if (detectAgain) { detectAgain = false; refresh(); }
   }
 }
 
@@ -313,14 +331,33 @@ $('dirname').oninput = () => {
   dirDebounce = setTimeout(() => { if (!busy) refresh(); }, 400);
 };
 
-$('foreignack').onchange = () => {
+$('overwrite').onchange = () => {
   $('fill').disabled = !device || !device.writable || blockedByForeign();
 };
+
+// Two clicks rather than a native confirm(). A webview's dialog support is the host's
+// business, not ours, and a confirm() that silently returns falsy would leave this
+// button doing nothing at all — a dead feature that looks alive. This is in our own
+// DOM, so it works wherever the app does. The filenames are already listed above the
+// button, so the second click is confirming something visible.
+let armedDelete = false;
+function disarmDelete() {
+  armedDelete = false;
+  $('delupdates').textContent = 'Delete staged update';
+  $('delupdates').classList.remove('danger');
+}
 
 $('delupdates').onclick = async () => {
   const names = device ? device.updates.map((u) => u.name) : [];
   if (!names.length) return;
-  if (!confirm(`Permanently delete from the Kindle:\n\n${names.join('\n')}\n\nThis cannot be undone.`)) return;
+  if (!armedDelete) {
+    armedDelete = true;
+    $('delupdates').textContent = 'Click again to delete permanently';
+    $('delupdates').classList.add('danger');
+    setTimeout(() => { if (armedDelete) disarmDelete(); }, 8000);
+    return;
+  }
+  disarmDelete();
   setBusy(true);
   try {
     log(await invoke('delete_updates', { names }));
@@ -338,7 +375,9 @@ $('fill').onclick = async () => {
   setBusy(true);
   $('barfill').style.width = '0%';
   try {
-    log(await invoke('start_fill', { low, high, dirName: dirName() }));
+    log(await invoke('start_fill', {
+      low, high, dirName: dirName(), overwrite: $('overwrite').checked,
+    }));
   } catch (e) {
     log('Error: ' + String(e));
   } finally {

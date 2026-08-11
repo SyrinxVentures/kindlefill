@@ -41,6 +41,10 @@ enum Command {
         /// Folder to put filler in, at the storage root.
         #[arg(long, default_value = engine::DEFAULT_FILL_DIR)]
         dir: String,
+        /// Empty that folder first, deleting anything already in it — including files
+        /// this tool did not write. Off by default; nothing else deletes them.
+        #[arg(long)]
+        overwrite: bool,
     },
     /// Delete all filler this tool wrote.
     Clean {
@@ -73,7 +77,7 @@ async fn main() -> Result<()> {
         Command::Probe => probe().await,
         Command::Bench => bench().await,
         Command::Status { dir } => status(&dir).await,
-        Command::Fill { low, high, dir } => fill(low, high, &dir).await,
+        Command::Fill { low, high, dir, overwrite } => fill(low, high, &dir, overwrite).await,
         Command::Clean { dir } => clean(&dir).await,
     }
 }
@@ -300,7 +304,7 @@ fn render_progress(p: &kindlefill_core::FillProgress, tty: bool) {
     let _ = io::Write::flush(&mut io::stderr());
 }
 
-async fn fill(low: u64, high: u64, dir_name: &str) -> Result<()> {
+async fn fill(low: u64, high: u64, dir_name: &str, overwrite: bool) -> Result<()> {
     let window = Window::new(low, high).map_err(|e| anyhow::anyhow!("{e}"))?;
     let device = open().await?;
     let mut storage = writable_storage(&device).await?;
@@ -318,6 +322,16 @@ async fn fill(low: u64, high: u64, dir_name: &str) -> Result<()> {
                 cancel.cancel();
             }
         });
+    }
+
+    if overwrite {
+        let removed = engine::purge_fill_dir(&mut storage, dir_name, |event| {
+            if let Event::Deleted { name, bytes } = event {
+                println!("  deleted {name} ({})", human_bytes(bytes));
+            }
+        })
+        .await?;
+        println!("emptied {dir_name}: {removed} item(s) deleted");
     }
 
     let started = Instant::now();

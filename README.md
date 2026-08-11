@@ -43,8 +43,8 @@ Those runs used a window shifted ~2.5 GB below current free space rather than th
 50–90 MB default. Same code path — the ladder still lays down 1 GiB objects, so Stop is
 still tested mid-object — without parking the device at 70 MB free for the duration.
 
-The one path still unexercised is `ptpcamerad` taming, because the daemon has not been
-running on the machine this was tested on.
+Three paths have *not* been exercised on hardware and rest on the test suite alone —
+see [What has and hasn't been exercised on hardware](#what-has-and-hasnt-been-exercised-on-hardware).
 
 ## Why this isn't just "copy some big files over"
 
@@ -105,14 +105,18 @@ minutes if you find out afterwards:
 
 - **The folder by name.** Filler goes in `fill_disk` at the storage root, and the app
   says so rather than reporting a file count — undoing this by hand means knowing what
-  to look for. The name is editable if that folder is taken.
-- **Anything in that folder that isn't ours.** `clean` never touches it, which means
-  the folder survives removal; that's worth knowing up front rather than discovering
-  afterwards. Items are listed by name and Fill is held until you confirm.
-- **A firmware update that's already downloaded.** Filling around one accomplishes
-  nothing — the bytes are on the device and it installs them at the next restart. The
-  app lists any `update_*.bin` at the root and offers to delete it, by name, on
-  confirmation.
+  to look for. The name is editable, and changing it re-checks the new folder.
+- **Whether that folder already exists holding something that isn't ours.** The items
+  are listed by name, and Fill is held until you either pick a different name or tick
+  **Overwrite**, which empties the folder completely — including those files. That tick
+  is the only way anything in there gets deleted; it resets on every re-check, so a
+  confirmation given for one folder can't be spent on another.
+- **A downloaded firmware update.** Any `update_*.bin` at the root is listed by name,
+  with a two-click delete if you want it gone. Stated rather than insisted on: it's
+  your device, and it might be your file.
+
+A folder holding *only* filler this tool wrote is not a conflict — that's a resume, and
+there is nothing there to lose. It says how much is already there and continues from it.
 
 ## CLI
 
@@ -125,9 +129,13 @@ cargo run -p kindlefill-cli -- fill --low 40MB --high 80MB
 cargo run -p kindlefill-cli -- clean     # remove all filler
 ```
 
-`status`, `fill` and `clean` take `--dir` to work in a folder other than `fill_disk`.
+`status`, `fill` and `clean` take `--dir` to work in a folder other than `fill_disk`,
+and `fill --overwrite` empties that folder first — including files this tool didn't
+write. Without it, nothing else in the crate removes them.
+
 `status` also reports anything in that folder this tool didn't write, and any staged
-firmware update at the root — the CLI reports those; only the app deletes them.
+firmware update at the root. Deleting an update is the app's job; the CLI only says
+it's there.
 
 `fill` renders a live progress bar with throughput and ETA:
 
@@ -196,7 +204,7 @@ would pass every test here and hang on the cable. That's what `bench` is for, an
 Paperwhite Signature Edition it came back exact.
 
 ```bash
-cargo test      # 37 tests, no hardware required
+cargo test      # 42 tests, no hardware required
 ```
 
 ## License
@@ -221,8 +229,24 @@ this work shall be dual-licensed as above, with no additional terms or condition
 Fill and unfill. It does not jailbreak anything and doesn't check whether your firmware
 is jailbreakable. Turn on Airplane Mode.
 
-A staged `update_*.bin` is the one piece of device content this tool will delete that it
-didn't write, and only from the app, only after showing you the filename, and only on
-confirmation. Everything else on the Kindle is out of reach by construction: the engine
-deletes exactly two things, filler it can prove it wrote and updates you named, and the
-folder itself only when nothing but filler was in it.
+By default the only things deleted are files it can prove it wrote, plus the filler
+folder itself when nothing else was in it. Two paths go further, and both need you to
+ask for them explicitly, by name, in the app:
+
+- **Overwrite** empties the filler folder, whatever is in it.
+- **Delete staged update** removes named `update_*.bin` files from the root.
+
+Neither is reachable by accident. The update deletion in particular passes three
+independent gates — root-level, matches the shape, and present in the list you
+confirmed — so a name arriving from the UI that isn't a root-level update image deletes
+nothing. `tests/virtual_device.rs` exercises both against a real directory, including
+the cases that must survive.
+
+## What has and hasn't been exercised on hardware
+
+Fill, Stop, resume, and Remove Filler have all been run against a Paperwhite Signature
+Edition (see Status). Three paths have not, and are covered only by the test suite:
+
+- **`ptpcamerad` taming** — the daemon wasn't running on the test machine.
+- **Deleting a staged firmware update** — no update was staged on the test device.
+- **Overwrite** — the test folder never held foreign content.

@@ -113,6 +113,19 @@ fn explain(error: &mtp_rs::Error) -> String {
     format!("{error}")
 }
 
+/// [`explain`] for the engine's own error type.
+///
+/// A fill or clean that fails because something else holds the device deserves the same
+/// guidance as a failed open — it's the identical problem, and routing it through
+/// `to_string()` instead would print the raw MTP error for one path and the helpful
+/// text for the other.
+fn explain_fill(error: &engine::FillError) -> String {
+    match error {
+        engine::FillError::Mtp(e) => explain(e),
+        other => other.to_string(),
+    }
+}
+
 /// An open Kindle, plus the things that have to stay alive alongside it.
 ///
 /// The device handle must outlive the operation — dropping it closes the MTP session —
@@ -314,6 +327,7 @@ async fn start_fill(
     low: u64,
     high: u64,
     dir_name: String,
+    overwrite: bool,
 ) -> Result<String, String> {
     let window = Window::new(low, high).map_err(|e| e.to_string())?;
     engine::validate_dir_name(&dir_name).map_err(|e| e.to_string())?;
@@ -327,6 +341,21 @@ async fn start_fill(
 
     let mut session = open_device().await?;
     let storage = &mut session.storage;
+
+    // Taking the folder over is a separate, explicit act that happens before any
+    // filling — so if it fails, nothing has been written yet, and if the caller didn't
+    // ask for it, the destructive path isn't reached at all.
+    if overwrite {
+        let handle = app.clone();
+        let removed = engine::purge_fill_dir(storage, &dir_name, move |ev| forward(&handle, ev))
+            .await
+            .map_err(|e| explain_fill(&e))?;
+        log(
+            &app,
+            format!("Emptied {dir_name} — {removed} item(s) deleted."),
+        );
+    }
+
     let handle = app.clone();
     let outcome =
         engine::fill_with_cancel(storage, window, &dir_name, Some(&token), move |ev| {
@@ -336,7 +365,7 @@ async fn start_fill(
 
     *state.cancel.lock().unwrap() = None;
 
-    match outcome.map_err(|e| e.to_string())? {
+    match outcome.map_err(|e| explain_fill(&e))? {
         engine::Outcome::InWindow { free } => Ok(format!(
             "Done — {} free, inside the target window.",
             human_bytes(free)
@@ -365,7 +394,7 @@ async fn start_clean(
     let handle = app.clone();
     let free = engine::clean(storage, &dir_name, move |ev| forward(&handle, ev))
         .await
-        .map_err(|e| explain(&e))?;
+        .map_err(|e| explain_fill(&e))?;
 
     *state.cancel.lock().unwrap() = None;
     Ok(format!("Filler removed — {} free.", human_bytes(free)))

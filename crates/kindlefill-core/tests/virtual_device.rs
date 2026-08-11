@@ -361,3 +361,196 @@ async fn refuses_to_fill_a_device_already_below_the_window() {
         "must not leave an empty fill_disk behind after refusing"
     );
 }
+
+async fn put(storage: &Storage, parent: ObjectHandle, name: &str, size: u64) {
+    storage
+        .upload(
+            Some(parent),
+            NewObjectInfo::file(name, size),
+            kindlefill_core::ZeroStream::new(size),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("upload {name}"));
+}
+
+async fn root_names(storage: &Storage) -> Vec<String> {
+    let mut names: Vec<String> = storage
+        .list_objects(Some(ObjectHandle::ROOT))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|o| o.filename)
+        .collect();
+    names.sort();
+    names
+}
+
+/// A staged firmware image is the only device content this tool deletes that it did not
+/// write, so the three gates on that deletion are the ones worth exercising against a
+/// real filesystem rather than trusting to a doc comment.
+#[tokio::test]
+async fn deleting_staged_updates_removes_only_named_root_level_images() {
+    let tmp = tempfile::tempdir().unwrap();
+    let device = open(tmp.path()).await;
+    let mut storage = storage_of(&device).await;
+
+    // Two real update images, plus three files that must survive: one that only looks
+    // like an update, one book, and one genuine-shaped image nested inside a folder
+    // rather than at the root.
+    put(&storage, ObjectHandle::ROOT, "update_kindle_pw5_5.18.1.bin", 4096).await;
+    put(&storage, ObjectHandle::ROOT, "update_kindle_other.bin", 4096).await;
+    put(&storage, ObjectHandle::ROOT, "updates_notes.bin", 4096).await;
+    put(&storage, ObjectHandle::ROOT, "mybook.azw3", 4096).await;
+    let sub = storage
+        .create_folder(Some(ObjectHandle::ROOT), "documents")
+        .await
+        .expect("create folder");
+    put(&storage, sub, "update_kindle_nested.bin", 4096).await;
+
+    let staged: Vec<String> = engine::list_staged_updates(&storage)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|o| o.filename)
+        .collect();
+    assert_eq!(
+        staged,
+        vec!["update_kindle_other.bin", "update_kindle_pw5_5.18.1.bin"],
+        "only root-level update_*.bin should be reported"
+    );
+
+    // The name list is a request, not an instruction: two of these three are not
+    // root-level staged images and must be ignored rather than deleted.
+    let asked = vec![
+        "update_kindle_pw5_5.18.1.bin".to_string(),
+        "mybook.azw3".to_string(),
+        "update_kindle_nested.bin".to_string(),
+    ];
+    let removed = engine::delete_staged_updates(&mut storage, &asked, |_| {})
+        .await
+        .expect("delete");
+
+    assert_eq!(
+        removed.iter().map(|o| o.filename.as_str()).collect::<Vec<_>>(),
+        vec!["update_kindle_pw5_5.18.1.bin"],
+        "a name that isn't a root-level staged image must delete nothing"
+    );
+    assert_eq!(
+        root_names(&storage).await,
+        vec![
+            "documents",
+            "mybook.azw3",
+            "update_kindle_other.bin",
+            "updates_notes.bin",
+        ]
+    );
+    // The nested lookalike is still where it was.
+    assert_eq!(
+        storage.list_objects(Some(sub)).await.unwrap().len(),
+        1,
+        "a folder's contents are out of reach entirely"
+    );
+}
+
+/// `list_fillers` decides what `clean` deletes and `list_foreign` decides what the UI
+/// warns about. They read the same folder through the same predicate, and this pins
+/// them as exact complements — the original bug was two views of "is this ours"
+/// drifting apart, and splitting the question across two functions reintroduces the
+/// opportunity.
+#[tokio::test]
+async fn filler_and_foreign_partition_the_folder_exactly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let device = open(tmp.path()).await;
+    let mut storage = storage_of(&device).await;
+
+    engine::fill(&mut storage, window(), DIR, |_| {}).await.expect("fill");
+    let dir = engine::find_fill_dir(&storage, DIR).await.unwrap().unwrap();
+    for name in ["mybook.azw3", "fill_notes.bin", "fill_12.bin", "fill_00000007.bin"] {
+        put(&storage, dir.handle, name, 1024).await;
+    }
+    storage
+        .create_folder(Some(dir.handle), "a_folder")
+        .await
+        .expect("create nested folder");
+
+    let all = storage.list_objects(Some(dir.handle)).await.unwrap().len();
+    let fillers = engine::list_fillers(&storage, dir.handle).await.unwrap();
+    let foreign = engine::list_foreign(&storage, dir.handle).await.unwrap();
+
+    assert_eq!(fillers.len() + foreign.len(), all, "must partition, not overlap or drop");
+    assert_eq!(foreign.len(), 5, "4 files plus the folder");
+    for f in &fillers {
+        assert!(f.is_file(), "a folder must never be counted as filler");
+        assert!(!foreign.iter().any(|o| o.handle == f.handle), "sets must be disjoint");
+    }
+}
+
+#[test]
+fn folder_names_that_would_escape_the_root_are_refused() {
+    for ok in ["fill_disk", "my filler", "Fill-Disk_2", "a.b"] {
+        assert!(engine::validate_dir_name(ok).is_ok(), "{ok} should be allowed");
+    }
+    for bad in ["", "..", ".", "a/b", "a\\b", "a:b", " lead", "trail ", "a\u{0}b", "a*b"] {
+        assert!(
+            engine::validate_dir_name(bad).is_err(),
+            "{bad:?} must be refused"
+        );
+    }
+}
+
+/// Overwriting a folder is the one path that deletes content the tool didn't write, so
+/// what it reaches — and what it doesn't — is worth pinning against a real filesystem.
+#[tokio::test]
+async fn overwriting_empties_the_folder_and_nothing_outside_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let device = open(tmp.path()).await;
+    let mut storage = storage_of(&device).await;
+
+    // Something at the root that must survive: the purge is scoped to one named folder.
+    put(&storage, ObjectHandle::ROOT, "root_book.azw3", 1024).await;
+
+    engine::fill(&mut storage, window(), DIR, |_| {}).await.expect("fill");
+    let dir = engine::find_fill_dir(&storage, DIR).await.unwrap().unwrap();
+    put(&storage, dir.handle, "mybook.azw3", 1024).await;
+    // Nested, so the depth-first walk is actually exercised — MTP won't delete a
+    // folder that still has children.
+    let nested = storage
+        .create_folder(Some(dir.handle), "notes")
+        .await
+        .expect("create nested");
+    put(&storage, nested, "deep.txt", 512).await;
+
+    let before = free_space(&mut storage).await;
+    let removed = engine::purge_fill_dir(&mut storage, DIR, |_| {})
+        .await
+        .expect("purge");
+
+    assert!(removed >= 4, "should have removed filler, book, folder and its child");
+    let dir = engine::find_fill_dir(&storage, DIR)
+        .await
+        .unwrap()
+        .expect("the folder itself stays — fill is about to use it");
+    assert!(
+        storage.list_objects(Some(dir.handle)).await.unwrap().is_empty(),
+        "folder must be empty afterwards"
+    );
+    assert!(free_space(&mut storage).await > before, "space must come back");
+    assert!(
+        root_names(&storage).await.contains(&"root_book.azw3".to_string()),
+        "content outside the folder must be untouched"
+    );
+}
+
+#[tokio::test]
+async fn overwriting_a_folder_that_does_not_exist_is_a_no_op() {
+    let tmp = tempfile::tempdir().unwrap();
+    let device = open(tmp.path()).await;
+    let mut storage = storage_of(&device).await;
+    put(&storage, ObjectHandle::ROOT, "root_book.azw3", 1024).await;
+
+    assert_eq!(
+        engine::purge_fill_dir(&mut storage, DIR, |_| {}).await.expect("purge"),
+        0
+    );
+    assert_eq!(root_names(&storage).await, vec!["root_book.azw3"]);
+}

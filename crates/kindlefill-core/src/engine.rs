@@ -309,6 +309,64 @@ pub async fn list_foreign(
         .collect())
 }
 
+/// Empty the filler folder completely, including content this tool did not write.
+///
+/// This is the only operation in the crate that removes device content we can't prove
+/// we created, and it exists solely because a caller asked to take the folder over
+/// wholesale. Nothing calls it implicitly: `fill` does not, `clean` does not, and the
+/// front ends reach it only behind an explicit opt-in that names the loss.
+///
+/// Depth-first, because MTP will not delete a folder that still has children — and
+/// doing the recursion here rather than trusting the library to means the set of
+/// objects removed is exactly the set this function walked.
+///
+/// Scoped to the named folder at the storage root: it takes a name, resolves it the
+/// same way everything else does, and can't be pointed at the root itself.
+pub async fn purge_fill_dir<F>(
+    storage: &mut Storage,
+    dir_name: &str,
+    mut on_event: F,
+) -> Result<usize, FillError>
+where
+    F: FnMut(Event) + Send,
+{
+    validate_dir_name(dir_name)?;
+    let Some(dir) = find_fill_dir(storage, dir_name).await? else {
+        return Ok(0);
+    };
+    let removed = purge_children(storage, dir.handle, &mut on_event).await?;
+    let free = measure(storage).await?;
+    on_event(Event::Finished { free });
+    Ok(removed)
+}
+
+/// Delete everything under `parent`, children before parents. Boxed because it
+/// recurses, and an `async fn` that calls itself needs an indirection to have a size.
+fn purge_children<'a, F>(
+    storage: &'a mut Storage,
+    parent: ObjectHandle,
+    on_event: &'a mut F,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize, Error>> + Send + 'a>>
+where
+    F: FnMut(Event) + Send,
+{
+    Box::pin(async move {
+        let mut removed = 0;
+        for child in storage.list_objects(Some(parent)).await? {
+            if child.is_folder() {
+                removed += purge_children(storage, child.handle, on_event).await?;
+            }
+            storage.delete(child.handle).await?;
+            on_event(Event::Deleted {
+                name: child.filename,
+                bytes: child.size,
+            });
+            removed += 1;
+        }
+        Ok(removed)
+    })
+}
+
 /// Next unused sequence number, so an interrupted run tops up instead of colliding.
 fn next_sequence(existing: &[ObjectInfo]) -> u32 {
     existing
@@ -485,10 +543,14 @@ pub async fn clean<F>(
     storage: &mut Storage,
     dir_name: &str,
     mut on_event: F,
-) -> Result<u64, Error>
+) -> Result<u64, FillError>
 where
     F: FnMut(Event),
 {
+    // Validated here rather than left to callers, for the same reason `fill` does it:
+    // there are two front ends, and a guard that each one has to remember is a guard
+    // one of them will eventually forget.
+    validate_dir_name(dir_name)?;
     let Some(dir) = find_fill_dir(storage, dir_name).await? else {
         let free = measure(storage).await?;
         on_event(Event::Finished { free });

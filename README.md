@@ -79,9 +79,28 @@ streams them straight into the upload, so the host never stores a byte.
 ## The app
 
 ```bash
-cargo run -p kindlefill-app          # run it
-cargo tauri build                    # build a .app / .dmg (needs `cargo install tauri-cli`)
+cargo run -p kindlefill-app                    # run it from source
+cd crates/kindlefill-app && cargo tauri build   # build a double-clickable .app and .dmg
 ```
+
+`cargo tauri build` needs `cargo install tauri-cli --version "^2"`, and must run from
+the app crate — that's where `tauri.conf.json` lives. It writes:
+
+```
+target/release/bundle/macos/KindleFill.app      drag to /Applications
+target/release/bundle/dmg/KindleFill_0.1.0_aarch64.dmg
+```
+
+The bundle is **ad-hoc signed**, not notarized. Built locally it opens by
+double-click, because macOS only quarantines files that arrive from elsewhere. Sent
+to anyone else it will be quarantined and Gatekeeper will refuse it until they
+right-click → Open — so a build for other people needs a Developer ID and
+notarization, not just this command.
+
+The `-p kindlefill-app` above is the crate; the binary it produces is `KindleFill`.
+Unbundled, macOS takes the Dock and app-menu label from the executable name, so
+without that the app would introduce itself as "kindlefill-app" during development
+while the shipped bundle said KindleFill.
 
 The frontend is a single static HTML file with no framework and no build step, so
 `cargo run` is enough — there's no dev server to start first.
@@ -165,6 +184,12 @@ half that deletes.
 
 `probe` and `bench` answered the two questions that gated the design, and stay useful
 for checking a different Kindle model:
+
+`bench` is also the fastest way to tell a wedged device from a broken build. An
+interrupted transfer — an unplug mid-write, a process killed while it held the
+device — can leave a Kindle answering reads while refusing every write: `status`
+reports free space happily, and creating a folder times out. Unplug and replug (or
+restart the Kindle) and run `bench`; if it completes, writes are healthy again.
 
 1. **Does `pkill ptpcamerad` work without sudo?** `probe` answers this by trying. If it
    needs elevation, the GUI needs an admin prompt or a privileged helper — a

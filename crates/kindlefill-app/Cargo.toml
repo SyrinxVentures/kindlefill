@@ -6,6 +6,16 @@ license.workspace = true
 repository.workspace = true
 description = "Desktop UI for kindlefill."
 
+# The crate keeps the workspace's `-app` suffix so `cargo run -p kindlefill-app`
+# still reads clearly next to `kindlefill-cli`, but the binary carries the product
+# name. Unbundled — which is how `cargo run` launches it — macOS takes the app menu
+# and Dock label straight from the executable, so without this the app introduces
+# itself as "kindlefill-app". The bundled .app was always KindleFill; only the dev
+# run disagreed.
+[[bin]]
+name = "KindleFill"
+path = "src/main.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

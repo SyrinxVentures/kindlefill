@@ -11,8 +11,9 @@
 // Release builds must not pop a console window behind the app on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use kindlefill_core::{engine, human_bytes, human_duration, is_exclusive_access,
-                      is_permission_denied, ptpcamerad, Event, Window};
+use kindlefill_core::{engine, human_bytes, human_duration, is_disconnected,
+                      is_exclusive_access, is_permission_denied, is_timeout, ptpcamerad,
+                      Event, Window};
 use mtp_rs::{CancelToken, MtpDevice, Storage};
 use serde::Serialize;
 use std::sync::Mutex;
@@ -109,6 +110,19 @@ fn explain(error: &mtp_rs::Error) -> String {
             "The system refused access to the device (nothing else is holding it). \
              On Linux this usually means missing udev rules. Underlying error: {error}"
         );
+    }
+    if is_timeout(error) {
+        return "The Kindle stopped responding. Its MTP session can end up wedged \
+                after an interrupted transfer — often it still answers reads while \
+                refusing every write, so the device looks fine here but nothing can \
+                be written. Unplug and replug the cable; if that doesn't clear it, \
+                restart the Kindle (hold the power button, then Restart)."
+            .to_string();
+    }
+    if is_disconnected(error) {
+        return "The Kindle disconnected. Replug the cable and press Refresh. \
+                Anything already written is intact — Fill again resumes from it."
+            .to_string();
     }
     format!("{error}")
 }

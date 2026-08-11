@@ -53,6 +53,27 @@ pub fn is_permission_denied(error: &mtp_rs::Error) -> bool {
     matches!(error, mtp_rs::Error::PermissionDenied)
 }
 
+/// Whether the device stopped answering.
+///
+/// Worth its own case because of what it usually means in practice. A Kindle whose
+/// MTP session was interrupted — an unplug mid-transfer, a process killed while it
+/// held the device — can end up answering reads while refusing every write, which
+/// looks like a broken tool rather than a device that needs reconnecting. The give-
+/// away is `GetStorageInfo` succeeding while creating a folder times out.
+#[must_use]
+pub fn is_timeout(error: &mtp_rs::Error) -> bool {
+    matches!(error, mtp_rs::Error::Timeout)
+}
+
+/// Whether the device went away mid-operation, or its session was reset under us.
+#[must_use]
+pub fn is_disconnected(error: &mtp_rs::Error) -> bool {
+    matches!(
+        error,
+        mtp_rs::Error::Disconnected | mtp_rs::Error::NoDevice | mtp_rs::Error::DeviceReset
+    )
+}
+
 /// Human-readable byte size, sized to how people talk about Kindle storage.
 #[must_use]
 pub fn human_bytes(bytes: u64) -> String {

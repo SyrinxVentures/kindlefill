@@ -12,15 +12,27 @@ use std::time::Duration;
 /// `Duration::from_secs_f64` away from its overflow panic.
 const MAX_ETA: Duration = Duration::from_secs(99 * 3600);
 
-/// Exponentially-smoothed transfer rate in bytes per second.
+/// Transfer rate over a trailing time window, in bytes per second.
 ///
-/// Smoothed rather than averaged over the whole run because MTP throughput is lumpy:
-/// the device commits an object, pauses, and starts the next. A plain average lets an
-/// early stall distort the estimate for the rest of a 20-minute transfer.
+/// **Bytes moved divided by time elapsed** — not an average of instantaneous rate
+/// samples. That distinction is the whole design, and getting it wrong is not merely
+/// cosmetic: MTP throughput arrives in bursts as the host buffer flushes, so a 100 ms
+/// sample carrying 10 MB reads as 100 MB/s. Averaging *rates* gives that burst the
+/// same weight as a slow sample and lands high; on a real Paperwhite transfer running
+/// at a true 25.5 MB/s, an exponential average of samples read 22-86 MB/s and centred
+/// near 35. Dividing total bytes by total time cannot do that — it reported 23-27.
+///
+/// The window also makes the estimate independent of how often progress is reported.
+/// Weighting each sample equally means the answer changes when the callback cadence
+/// changes, which is not a property anyone wants from a throughput readout.
+///
+/// Clock-free by design: elapsed time is passed in rather than read, so every case
+/// below is testable without sleeping.
 #[derive(Debug, Clone)]
 pub struct RateEstimator {
-    ema: Option<f64>,
-    alpha: f64,
+    /// `(elapsed_since_job_start, cumulative_bytes)`, oldest first. Trimmed to
+    /// [`ETA_WINDOW`], which is the longest horizon anything here asks for.
+    samples: std::collections::VecDeque<(Duration, u64)>,
 }
 
 impl Default for RateEstimator {
@@ -30,50 +42,94 @@ impl Default for RateEstimator {
 }
 
 impl RateEstimator {
-    /// Weight of each new sample. Low enough to ride out per-object commit pauses,
-    /// high enough that the estimate still tracks a genuine slowdown.
-    pub const DEFAULT_ALPHA: f64 = 0.15;
+    /// Horizon for the displayed rate. Short enough to show a real slowdown promptly,
+    /// long enough to span several of the device's commit pauses. Measured on hardware:
+    /// 5 s held the readout inside a 3.3 MB/s band on a transfer whose true rate was
+    /// 25.5, where 2 s gave 10 MB/s of swing.
+    pub const RATE_WINDOW: Duration = Duration::from_secs(5);
+
+    /// Horizon for the ETA. Longer, because a remaining-time figure that twitches is
+    /// worse than one that lags — but still bounded, so a device that genuinely slows
+    /// down in the last third is reflected rather than averaged away.
+    pub const ETA_WINDOW: Duration = Duration::from_secs(30);
+
+    /// Below this much history the window is too short to divide by honestly, and the
+    /// answer would be the same burst artefact the window exists to avoid.
+    const MIN_SPAN: Duration = Duration::from_millis(750);
 
     #[must_use]
     pub fn new() -> Self {
-        Self::with_alpha(Self::DEFAULT_ALPHA)
-    }
-
-    #[must_use]
-    pub fn with_alpha(alpha: f64) -> Self {
         Self {
-            ema: None,
-            alpha: alpha.clamp(0.01, 1.0),
+            samples: std::collections::VecDeque::new(),
         }
     }
 
-    /// Record that `bytes` moved in `elapsed`.
+    /// Record that `cumulative` bytes of the job had moved at `at` (elapsed since the
+    /// job began).
     ///
-    /// Samples carrying no information are dropped rather than folded in: a zero
-    /// duration would divide by zero, and a zero-byte sample would drag the estimate
-    /// toward nothing during an ordinary between-object pause.
-    pub fn observe(&mut self, bytes: u64, elapsed: Duration) {
-        let secs = elapsed.as_secs_f64();
-        if bytes == 0 || secs <= 0.0 {
-            return;
+    /// Cumulative rather than incremental because the window needs to subtract two
+    /// readings taken seconds apart, and reconstructing that from deltas would just be
+    /// this buffer with extra steps.
+    ///
+    /// A reading that goes *backwards* clears the history instead of being dropped.
+    /// It happens for real: `done` is re-derived from the device's own free-space
+    /// figure at each object boundary, and per-file overhead means free space can fall
+    /// further than the bytes we wrote — or rise, if the Kindle tidies up behind us.
+    /// Merely ignoring the sample would leave the next good one measuring its delta
+    /// against an anchor from before the step, and no clamp fixes a window that spans
+    /// a discontinuity.
+    pub fn observe(&mut self, cumulative: u64, at: Duration) {
+        if let Some(&(last_at, last_bytes)) = self.samples.back() {
+            if cumulative < last_bytes {
+                self.samples.clear();
+            } else if at < last_at {
+                // Time cannot run backwards; a caller that says so is confused enough
+                // that the safe move is to start over rather than reason about it.
+                self.samples.clear();
+            }
         }
-        let sample = bytes as f64 / secs;
-        if !sample.is_finite() {
-            return;
+        self.samples.push_back((at, cumulative));
+        while let Some(&(oldest, _)) = self.samples.front() {
+            if at.saturating_sub(oldest) > Self::ETA_WINDOW && self.samples.len() > 2 {
+                self.samples.pop_front();
+            } else {
+                break;
+            }
         }
-        self.ema = Some(match self.ema {
-            None => sample,
-            Some(prev) => self.alpha * sample + (1.0 - self.alpha) * prev,
-        });
     }
 
-    /// Bytes per second, or `None` before any usable sample.
+    /// Throughput over `window`, or `None` until there is enough history to divide by.
+    fn windowed(&self, window: Duration) -> Option<f64> {
+        let &(newest_at, newest_bytes) = self.samples.back()?;
+        // Oldest sample still inside the window; falls back to the oldest we have.
+        let cutoff = newest_at.saturating_sub(window);
+        let (from_at, from_bytes) = self
+            .samples
+            .iter()
+            .find(|(at, _)| *at >= cutoff)
+            .copied()
+            .or_else(|| self.samples.front().copied())?;
+
+        let secs = newest_at.saturating_sub(from_at).as_secs_f64();
+        if secs < Self::MIN_SPAN.as_secs_f64() {
+            return None;
+        }
+        let bytes = newest_bytes.saturating_sub(from_bytes) as f64;
+        let rate = bytes / secs;
+        // Zero is a legitimate answer, not a missing one. A window in which nothing
+        // moved means the transfer has stalled, and "0.0 MB/s" says that; "—" claims
+        // we don't know, which is a different and less useful statement. `eta` divides
+        // by this and guards the resulting infinity itself.
+        rate.is_finite().then_some(rate)
+    }
+
+    /// Bytes per second over the display window, or `None` before it means anything.
     #[must_use]
     pub fn rate(&self) -> Option<f64> {
-        self.ema.filter(|r| *r > 0.0)
+        self.windowed(Self::RATE_WINDOW)
     }
 
-    /// Time to move `remaining` bytes at the current rate.
+    /// Time to move `remaining` bytes, from a longer horizon than [`rate`].
     ///
     /// `None` means genuinely unknown — render that as "estimating", never as zero.
     #[must_use]
@@ -81,7 +137,7 @@ impl RateEstimator {
         if remaining == 0 {
             return Some(Duration::ZERO);
         }
-        let secs = remaining as f64 / self.rate()?;
+        let secs = remaining as f64 / self.windowed(Self::ETA_WINDOW)?;
         if !secs.is_finite() || secs < 0.0 {
             return None;
         }
@@ -143,42 +199,148 @@ pub fn human_duration(d: Duration) -> String {
     }
 }
 
+/// Render a *remaining* time, rounded to a precision anyone would believe.
+///
+/// Separate from [`human_duration`], which stays exact, because the two are answering
+/// different questions. An estimate printed to the second invites you to watch the
+/// last digit, and the last digit is the part that is least true — a 17-minute
+/// transfer does not know its own finish to within a second. Rounding coarser as the
+/// figure grows keeps the display still while the underlying estimate moves within
+/// its own error, which is the point: the numbers stop twitching without anything
+/// being smoothed away.
+#[must_use]
+pub fn human_eta(d: Duration) -> String {
+    let secs = d.as_secs();
+    let step = match secs {
+        0..=59 => 5,
+        60..=599 => 10,
+        _ => 60,
+    };
+    // Round to the nearest step, but never down to "0s" while work remains — that
+    // reads as finished.
+    let rounded = ((secs + step / 2) / step * step).max(if secs > 0 { step } else { 0 });
+    human_duration(Duration::from_secs(rounded))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn rate_is_unknown_before_any_sample() {
-        assert_eq!(RateEstimator::new().rate(), None);
-        assert_eq!(RateEstimator::new().eta(1000), None);
+    /// Feed a steady `bytes_per_sec` for `secs`, sampling `per_sec` times a second,
+    /// continuing from `(at, bytes)`. Returns where it left off, so segments at
+    /// different speeds can be chained without the byte count ever stepping back.
+    fn steady(
+        r: &mut RateEstimator,
+        bytes_per_sec: u64,
+        secs: f64,
+        per_sec: f64,
+        at: Duration,
+        bytes: u64,
+    ) -> (Duration, u64) {
+        let n = (secs * per_sec).round() as u64;
+        let (mut t, mut total) = (at, bytes);
+        for i in 1..=n {
+            let offset = i as f64 / per_sec;
+            t = at + Duration::from_secs_f64(offset);
+            total = bytes + (bytes_per_sec as f64 * offset) as u64;
+            r.observe(total, t);
+        }
+        (t, total)
     }
 
     #[test]
-    fn first_sample_is_taken_at_face_value() {
+    fn rate_is_unknown_before_there_is_enough_history_to_divide_by() {
         let mut r = RateEstimator::new();
-        r.observe(10_000_000, Duration::from_secs(1));
-        assert_eq!(r.rate(), Some(10_000_000.0));
+        assert_eq!(r.rate(), None);
+        assert_eq!(r.eta(1000), None);
+        // A single reading spans no time at all.
+        r.observe(10_000_000, Duration::from_millis(100));
+        assert_eq!(r.rate(), None, "one sample is not a rate");
+        // Still inside MIN_SPAN.
+        r.observe(20_000_000, Duration::from_millis(400));
+        assert_eq!(r.rate(), None);
     }
 
     #[test]
-    fn smoothing_moves_toward_new_samples_without_jumping_to_them() {
-        let mut r = RateEstimator::with_alpha(0.5);
-        r.observe(10_000_000, Duration::from_secs(1));
-        r.observe(20_000_000, Duration::from_secs(1));
-        assert_eq!(r.rate(), Some(15_000_000.0));
-    }
-
-    /// A zero-duration sample would divide by zero; a zero-byte sample is the ordinary
-    /// pause between objects and must not drag the estimate to nothing.
-    #[test]
-    fn ignores_samples_that_carry_no_information() {
+    fn rate_is_bytes_over_elapsed_time() {
         let mut r = RateEstimator::new();
-        r.observe(10_000_000, Duration::from_secs(1));
-        let baseline = r.rate();
+        steady(&mut r, 10_000_000, 4.0, 10.0, Duration::ZERO, 0);
+        let rate = r.rate().expect("rate");
+        assert!(
+            (rate - 10_000_000.0).abs() < 100_000.0,
+            "expected ~10 MB/s, got {rate}"
+        );
+    }
 
-        r.observe(5_000_000, Duration::ZERO);
-        r.observe(0, Duration::from_secs(5));
-        assert_eq!(r.rate(), baseline, "estimate should be untouched");
+    /// The bug this design exists to prevent. MTP delivers bursts: the host buffer
+    /// flushes, then the device commits while nothing moves. Averaging *instantaneous
+    /// rates* weights the 100 ms burst the same as the 900 ms lull and lands roughly
+    /// 10x high. Dividing bytes by elapsed time cannot.
+    #[test]
+    fn bursty_transfer_reports_its_true_average_not_its_peaks() {
+        let mut r = RateEstimator::new();
+        let (mut t, mut total) = (Duration::ZERO, 0u64);
+        // 1 MB every second, but delivered in a single 100 ms burst each time:
+        // instantaneous peak is 10 MB/s, true throughput is 1 MB/s.
+        for _ in 0..30 {
+            t += Duration::from_millis(100);
+            total += 1_000_000;
+            r.observe(total, t);
+            t += Duration::from_millis(900);
+            r.observe(total, t); // the lull: no new bytes
+        }
+        let rate = r.rate().expect("rate");
+        assert!(
+            (rate - 1_000_000.0).abs() < 100_000.0,
+            "true rate is 1 MB/s; reported {rate} — peaks are leaking into the average"
+        );
+    }
+
+    /// The same bytes over the same time must read the same regardless of how often
+    /// progress happened to be reported. Weighting per sample got this wrong.
+    #[test]
+    fn reported_rate_does_not_depend_on_callback_cadence() {
+        let (mut sparse, mut dense) = (RateEstimator::new(), RateEstimator::new());
+        steady(&mut sparse, 8_000_000, 10.0, 1.0, Duration::ZERO, 0);
+        steady(&mut dense, 8_000_000, 10.0, 20.0, Duration::ZERO, 0);
+        let (a, b) = (sparse.rate().unwrap(), dense.rate().unwrap());
+        assert!(
+            (a - b).abs() / a < 0.05,
+            "cadence changed the answer: {a} vs {b}"
+        );
+    }
+
+    /// A pause between objects is not a slowdown to zero, but it is real elapsed time
+    /// and the rate should reflect it rather than ignoring it.
+    #[test]
+    fn a_stall_pulls_the_rate_down_rather_than_being_ignored() {
+        let mut r = RateEstimator::new();
+        let (_, done) = steady(&mut r, 10_000_000, 5.0, 10.0, Duration::ZERO, 0);
+        let moving = r.rate().unwrap();
+        // Four seconds where nothing moves.
+        r.observe(done, Duration::from_secs(9));
+        let stalled = r.rate().unwrap();
+        assert!(stalled < moving * 0.5, "{stalled} should be well under {moving}");
+    }
+
+    /// `done` is re-derived from the device's free space each object, so it can step
+    /// backwards. The window must not span the discontinuity.
+    #[test]
+    fn a_backwards_reading_restarts_the_window_instead_of_corrupting_it() {
+        let mut r = RateEstimator::new();
+        steady(&mut r, 10_000_000, 5.0, 10.0, Duration::ZERO, 0);
+        assert!(r.rate().is_some());
+
+        // The device reports less done than we already saw.
+        r.observe(1_000_000, Duration::from_secs(6));
+        assert_eq!(r.rate(), None, "history should have been dropped, not blended");
+
+        steady(&mut r, 4_000_000, 4.0, 10.0, Duration::from_secs(6), 1_000_000);
+        let rate = r.rate().expect("should recover");
+        assert!(
+            (rate - 4_000_000.0).abs() < 400_000.0,
+            "expected ~4 MB/s after re-anchoring, got {rate}"
+        );
     }
 
     #[test]
@@ -189,8 +351,12 @@ mod tests {
     #[test]
     fn eta_divides_remaining_by_rate() {
         let mut r = RateEstimator::new();
-        r.observe(1_000_000, Duration::from_secs(1));
-        assert_eq!(r.eta(10_000_000), Some(Duration::from_secs(10)));
+        steady(&mut r, 1_000_000, 4.0, 10.0, Duration::ZERO, 0);
+        let eta = r.eta(10_000_000).expect("eta");
+        assert!(
+            (eta.as_secs_f64() - 10.0).abs() < 0.5,
+            "expected ~10s, got {eta:?}"
+        );
     }
 
     /// A near-stalled transfer must not produce an absurd duration or panic
@@ -198,9 +364,35 @@ mod tests {
     #[test]
     fn eta_is_capped_rather_than_astronomical() {
         let mut r = RateEstimator::new();
-        r.observe(1, Duration::from_secs(3600));
+        r.observe(0, Duration::ZERO);
+        r.observe(1, Duration::from_secs(20));
         let eta = r.eta(u64::MAX).expect("should still produce a value");
         assert_eq!(eta, MAX_ETA);
+    }
+
+    /// The ETA leans on a longer horizon than the displayed rate, so a brief dip
+    /// moves the remaining-time figure less than it moves MB/s.
+    #[test]
+    fn eta_uses_a_longer_horizon_than_the_displayed_rate() {
+        assert!(RateEstimator::ETA_WINDOW > RateEstimator::RATE_WINDOW);
+        let mut r = RateEstimator::new();
+        let (at, done) = steady(&mut r, 10_000_000, 25.0, 10.0, Duration::ZERO, 0);
+        let (rate_before, eta_before) = (r.rate().unwrap(), r.eta(100_000_000).unwrap());
+
+        // Five seconds at a tenth of the speed: fills the rate window completely, but
+        // is only a sixth of the ETA window.
+        steady(&mut r, 1_000_000, 5.0, 10.0, at, done);
+        let (rate_after, eta_after) = (r.rate().unwrap(), r.eta(100_000_000).unwrap());
+
+        let rate_change = (rate_before - rate_after) / rate_before;
+        let eta_change = (eta_after.as_secs_f64() - eta_before.as_secs_f64()) / eta_before.as_secs_f64();
+        assert!(
+            rate_change > eta_change,
+            "the displayed rate should react more sharply than the ETA \
+             (rate fell {:.1}, eta rose {:.1})",
+            rate_change,
+            eta_change
+        );
     }
 
     #[test]
@@ -229,5 +421,33 @@ mod tests {
         assert_eq!(human_duration(Duration::from_secs(45)), "45s");
         assert_eq!(human_duration(Duration::from_secs(125)), "2m 05s");
         assert_eq!(human_duration(Duration::from_secs(7_325)), "2h 02m");
+    }
+
+    #[test]
+    fn eta_is_rounded_coarser_the_further_out_it_is() {
+        let s = |n| human_eta(Duration::from_secs(n));
+        assert_eq!(s(0), "0s");
+        assert_eq!(s(43), "45s", "under a minute rounds to 5s");
+        assert_eq!(s(127), "2m 10s", "under ten minutes rounds to 10s");
+        assert_eq!(s(1_016), "17m 00s", "beyond ten minutes rounds to the minute");
+        assert_eq!(s(7_325), "2h 02m");
+    }
+
+    /// Rounding must never render remaining work as "0s"; that reads as finished.
+    #[test]
+    fn a_nearly_finished_eta_never_rounds_down_to_nothing() {
+        assert_eq!(human_eta(Duration::from_secs(1)), "5s");
+        assert_eq!(human_eta(Duration::from_secs(2)), "5s");
+        assert_eq!(human_eta(Duration::ZERO), "0s", "only genuine zero shows zero");
+    }
+
+    /// The display should hold still while the underlying estimate wobbles inside its
+    /// own error — that is what stops the last digit twitching every 100 ms.
+    #[test]
+    fn small_wobbles_do_not_change_the_rendered_eta() {
+        // 16m 40s through 16m 52s all round to the same minute.
+        for secs in [1_000, 1_004, 1_008, 1_012] {
+            assert_eq!(human_eta(Duration::from_secs(secs)), "17m 00s", "{secs}");
+        }
     }
 }

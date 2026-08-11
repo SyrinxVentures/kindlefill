@@ -26,7 +26,7 @@ pub use engine::{
     NameError, Outcome, DEFAULT_FILL_DIR,
 };
 pub use plan::{next_step, Step, Window, WindowError, GIB, KIB, MIB};
-pub use rate::{human_duration, FillProgress, RateEstimator};
+pub use rate::{human_duration, human_eta, FillProgress, RateEstimator};
 pub use zeros::ZeroStream;
 
 /// Whether this failure is another process holding the device open.

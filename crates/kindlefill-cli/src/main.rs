@@ -276,7 +276,7 @@ async fn status(dir_name: &str) -> Result<()> {
 fn render_progress(p: &kindlefill_core::FillProgress, tty: bool) {
     let eta = p
         .eta
-        .map_or_else(|| "estimating".to_string(), kindlefill_core::human_duration);
+        .map_or_else(|| "estimating".to_string(), kindlefill_core::human_eta);
     let rate = p
         .rate
         .map_or_else(|| "--".to_string(), |r| format!("{:.1} MB/s", r / MIB as f64));

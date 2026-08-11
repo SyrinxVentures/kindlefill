@@ -439,6 +439,9 @@ where
     let dir = ensure_fill_dir(storage, dir_name).await?;
     let mut seq = next_sequence(&list_fillers(storage, dir).await?);
     let mut rate = RateEstimator::new();
+    // One clock for the whole job. The rate window spans object boundaries, so it
+    // needs a timeline that doesn't restart with each upload.
+    let job_start = Instant::now();
 
     loop {
         let free = measure(storage).await?;
@@ -470,9 +473,9 @@ where
                     // callback always reports. The bar should appear the moment a
                     // write starts rather than after a silent interval.
                     let mut last_emit: Option<Instant> = None;
-                    let mut last_sample = (now, 0u64);
                     let rate = &mut rate;
                     let on_event = &mut on_event;
+                    let _ = now;
 
                     storage
                         .upload_with_progress(
@@ -486,17 +489,17 @@ where
                                     return ControlFlow::Break(());
                                 }
                                 let now = Instant::now();
-                                rate.observe(
-                                    p.bytes_transferred.saturating_sub(last_sample.1),
-                                    now.duration_since(last_sample.0),
-                                );
-                                last_sample = (now, p.bytes_transferred);
+                                let done = committed.saturating_add(p.bytes_transferred);
+                                // Cumulative job bytes against elapsed job time, so the
+                                // estimator can divide across a window that outlives any
+                                // single object — the pauses between them are exactly
+                                // what a throughput figure has to include.
+                                rate.observe(done, now.duration_since(job_start));
 
                                 let due = last_emit
                                     .is_none_or(|t| now.duration_since(t) >= PROGRESS_INTERVAL);
                                 if due {
                                     last_emit = Some(now);
-                                    let done = committed.saturating_add(p.bytes_transferred);
                                     on_event(Event::Progress(FillProgress {
                                         done,
                                         total,

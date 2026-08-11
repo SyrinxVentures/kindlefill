@@ -114,7 +114,20 @@ measured rather than eyeballed.
 
 It shows the connected device, capacity, free space, and any filler already present;
 lets you set the target window; estimates the transfer up front; and runs the fill with
-a live bar, throughput, and ETA. **Stop** is wired to a real cancel token — checked
+a live bar, throughput, and ETA. The header keeps up during the fill — free space, the
+folder, and the filler tally all move as objects land, because `detect` holds the
+device open and so cannot run while a fill is using it; the figures come from the
+engine's own event stream instead.
+
+Throughput is **bytes moved divided by time elapsed** over a trailing five seconds,
+not an average of instantaneous samples. The distinction is not cosmetic. MTP arrives
+in bursts as the host buffer flushes, so a 100 ms sample carrying 10 MB reads as
+100 MB/s; averaging *rates* weights that burst like any other sample and lands high.
+On a transfer whose true throughput was 25.5 MB/s, the old exponential average read
+22-86 MB/s and centred near 35 — the displayed speed was wrong, and the ETA it fed was
+optimistic. The window reported 23.6-27.3, centred on 25.6. The ETA uses a longer
+thirty-second horizon and is rounded coarser the further out it is, so the text
+changes about once every four seconds instead of ten times a second. **Stop** is wired to a real cancel token — checked
 inside the upload rather than only between objects, so it responds in about a second
 rather than up to 40. Stopping is safe: the half-written object is deleted, everything
 committed stays valid, and pressing Fill again resumes.

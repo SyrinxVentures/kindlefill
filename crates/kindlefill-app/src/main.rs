@@ -11,7 +11,7 @@
 // Release builds must not pop a console window behind the app on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use kindlefill_core::{engine, human_bytes, human_duration, is_disconnected,
+use kindlefill_core::{engine, human_bytes, human_eta, is_disconnected,
                       is_exclusive_access, is_permission_denied, is_timeout, ptpcamerad,
                       Event, Window};
 use mtp_rs::{CancelToken, MtpDevice, Storage};
@@ -23,6 +23,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 /// Events the webview listens for.
 const EV_PROGRESS: &str = "kindlefill://progress";
 const EV_LOG: &str = "kindlefill://log";
+const EV_DEVICE: &str = "kindlefill://device";
 
 #[derive(Default)]
 struct AppState {
@@ -83,6 +84,9 @@ struct ProgressPayload {
     percent: f64,
     done_human: String,
     total_human: String,
+    /// Bytes per second, unformatted, so the pre-flight estimate can learn this
+    /// device's real speed instead of quoting a constant measured on someone else's.
+    rate: Option<f64>,
     rate_human: String,
     eta_human: String,
 }
@@ -90,6 +94,27 @@ struct ProgressPayload {
 #[derive(Serialize, Clone)]
 struct LogPayload {
     line: String,
+}
+
+/// A live correction to the device panel, sent as work happens.
+///
+/// The panel is otherwise painted from `detect`, which opens the device — and the
+/// device is held for the length of a fill, so during the seventeen minutes that
+/// matter most it cannot run. The result was a header confidently reading "not
+/// present yet" and "none" while the log below it listed fourteen written files.
+///
+/// Every figure needed is already in the engine's event stream, so this carries it
+/// rather than asking the device again: `free` is the value the engine just re-read,
+/// and the deltas let the UI keep its own tally without knowing how many files were
+/// there before it started.
+#[derive(Serialize, Clone)]
+struct DeviceUpdate {
+    /// Absent for events that don't re-measure — `Deleted` reports bytes, not free
+    /// space, and inventing a figure there would be worse than leaving the last one.
+    free: Option<u64>,
+    free_human: Option<String>,
+    files_delta: i32,
+    bytes_delta: i64,
 }
 
 /// Turn an MTP failure into something a person can act on.
@@ -204,9 +229,29 @@ fn trace(event: &Event) {
     }
 }
 
+/// Push a live correction to the device panel.
+fn device_update(app: &AppHandle, free: Option<u64>, files_delta: i32, bytes_delta: i64) {
+    let _ = app.emit(
+        EV_DEVICE,
+        DeviceUpdate {
+            free,
+            free_human: free.map(human_bytes),
+            files_delta,
+            bytes_delta,
+        },
+    );
+}
+
 /// Forward one engine event to the webview.
 fn forward(app: &AppHandle, event: Event) {
     trace(&event);
+    match &event {
+        Event::Started { free, .. } => device_update(app, Some(*free), 0, 0),
+        Event::Wrote { bytes, free, .. } => device_update(app, Some(*free), 1, *bytes as i64),
+        Event::Deleted { bytes, .. } => device_update(app, None, -1, -(*bytes as i64)),
+        Event::Finished { free } => device_update(app, Some(*free), 0, 0),
+        Event::Progress(_) => {}
+    }
     match event {
         Event::Started { free, aim, total } => log(
             app,
@@ -227,11 +272,12 @@ fn forward(app: &AppHandle, event: Event) {
                     percent: p.percent(),
                     done_human: human_bytes(p.done),
                     total_human: human_bytes(p.total),
+                    rate: p.rate,
                     rate_human: p.rate.map_or_else(
                         || "—".to_string(),
                         |r| format!("{:.1} MB/s", r / kindlefill_core::MIB as f64),
                     ),
-                    eta_human: p.eta.map_or_else(|| "estimating…".to_string(), human_duration),
+                    eta_human: p.eta.map_or_else(|| "estimating…".to_string(), human_eta),
                 },
             );
         }

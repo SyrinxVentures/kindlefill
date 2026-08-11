@@ -237,9 +237,13 @@ const { listen } = window.__TAURI__.event;
 const MB = 1024 * 1024;
 const $ = (id) => document.getElementById(id);
 let device = null, busy = false;
-// Seeded from the measured throughput of a Paperwhite Signature Edition. Replaced by
-// the live rate as soon as the transfer reports one, so it only ever shapes the
-// pre-flight estimate.
+// Only shapes the pre-flight estimate. Seeded from a Paperwhite Signature Edition and
+// replaced by this device's own measured throughput once a transfer reports one — so
+// the second estimate you see is about your Kindle and cable, not someone else's.
+//
+// Worth feeding back only because the reported rate is bytes-over-elapsed-time. An
+// average of instantaneous samples reads high on bursty MTP traffic, and learning from
+// that would have made every estimate progressively more optimistic.
 let observedRate = 25.5 * MB;
 
 function log(line) {
@@ -320,6 +324,45 @@ function fillList(el, items) {
   }
 }
 
+/// The three rows that change while an operation runs. One formatter, two callers —
+/// the full snapshot from `detect` and the live deltas that arrive during a fill —
+/// so the header can't say one thing before a fill and something differently-worded
+/// during it.
+function paintLiveRows(d) {
+  $('d-free').textContent = d.free_human;
+  // Named, not just counted: undoing this by hand means knowing what to look for.
+  $('d-dir').textContent = d.fill_dir + (d.fill_dir_exists ? '' : ' (not present yet)');
+  $('d-filler').textContent = d.filler_files
+    ? `${d.filler_files} file${d.filler_files === 1 ? '' : 's'}, ${d.filler_human}`
+    : 'none';
+}
+
+/// Apply one engine event's worth of change, so the panel tracks a running fill
+/// instead of freezing at whatever `detect` last saw. `detect` can't be called
+/// meanwhile: it opens the device, and the fill is holding it.
+function applyDeviceUpdate(u) {
+  if (!device) return;
+  if (u.free_human) { device.free = u.free; device.free_human = u.free_human; }
+  if (u.files_delta || u.bytes_delta) {
+    device.filler_files = Math.max(0, device.filler_files + u.files_delta);
+    device.filler_bytes = Math.max(0, device.filler_bytes + u.bytes_delta);
+    device.filler_human = humanBytes(device.filler_bytes);
+    // The first object written is also the moment the folder starts existing.
+    if (device.filler_files > 0) device.fill_dir_exists = true;
+  }
+  paintLiveRows(device);
+}
+
+/// Mirrors human_bytes in lib.rs. Duplicated deliberately and narrowly: the values
+/// updated here never make the IPC round trip that would let Rust format them.
+function humanBytes(bytes) {
+  const units = [['GB', 1024 ** 3], ['MB', 1024 ** 2], ['KB', 1024]];
+  for (const [suffix, scale] of units) {
+    if (bytes >= scale) return `${(bytes / scale).toFixed(2)} ${suffix}`;
+  }
+  return `${bytes} B`;
+}
+
 function renderDevice(d) {
   device = d;
   $('dot').className = 'dot ' + (d.writable ? 'ok' : 'bad');
@@ -327,12 +370,7 @@ function renderDevice(d) {
   $('devinfo').classList.remove('hidden');
   $('d-storage').textContent = d.storage;
   $('d-total').textContent = d.total_human;
-  $('d-free').textContent = d.free_human;
-  // Named, not just counted: undoing this by hand means knowing what to look for.
-  $('d-dir').textContent = d.fill_dir + (d.fill_dir_exists ? '' : ' (not present yet)');
-  $('d-filler').textContent = d.filler_files
-    ? `${d.filler_files} file${d.filler_files === 1 ? '' : 's'}, ${d.filler_human}`
-    : 'none';
+  paintLiveRows(d);
 
   const foreign = d.foreign.length > 0;
   $('foreignwarn').classList.toggle('hidden', !foreign);
@@ -400,10 +438,13 @@ async function refresh() {
 
 listen('kindlefill://log', (e) => log(e.payload.line));
 
+listen('kindlefill://device', (e) => applyDeviceUpdate(e.payload));
+
 listen('kindlefill://progress', (e) => {
   const p = e.payload;
   $('barfill').style.width = (p.fraction * 100).toFixed(1) + '%';
   $('bar').setAttribute('aria-valuenow', p.percent.toFixed(0));
+  if (p.rate > 0) observedRate = p.rate;
   $('p-left').textContent = `${p.percent.toFixed(1)}% — ${p.done_human} of ${p.total_human}`;
   $('p-right').textContent = `${p.rate_human} · ${p.eta_human} left`;
 });

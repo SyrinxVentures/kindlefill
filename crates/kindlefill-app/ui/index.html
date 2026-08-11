@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>KindleFill</title>
+<style>
+  :root {
+    --bg: #f6f6f7; --panel: #fff; --ink: #16171a; --muted: #6b7078;
+    --line: #dfe1e5; --accent: #2f6feb; --ok: #1a7f4b; --warn: #9a5b00; --bad: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17181b; --panel: #202226; --ink: #e9eaec; --muted: #9aa0a8;
+      --line: #33363c; --accent: #6a9bff; --ok: #4ec98a; --warn: #e0a458; --bad: #ff6b6b;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 20px; background: var(--bg); color: var(--ink);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  h1 { font-size: 17px; margin: 0 0 14px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px; margin-bottom: 14px;
+  }
+  .row { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; }
+  .row .k { color: var(--muted); }
+  .row .v { font-variant-numeric: tabular-nums; }
+  .status { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
+  label { color: var(--muted); display: block; margin-bottom: 4px; }
+  .targets { display: flex; gap: 10px; align-items: flex-end; }
+  .targets > div { flex: 1; }
+  input[type=number] {
+    width: 100%; padding: 7px 8px; border: 1px solid var(--line); border-radius: 7px;
+    background: var(--bg); color: var(--ink); font: inherit; font-variant-numeric: tabular-nums;
+  }
+  .buttons { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+  button {
+    padding: 8px 14px; border-radius: 7px; border: 1px solid var(--line);
+    background: var(--panel); color: var(--ink); font: inherit; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .45; cursor: default; }
+  .bar {
+    height: 10px; background: var(--bg); border: 1px solid var(--line);
+    border-radius: 6px; overflow: hidden; margin: 4px 0 8px;
+  }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  .meta { display: flex; justify-content: space-between; color: var(--muted); font-variant-numeric: tabular-nums; }
+  #log {
+    height: 150px; overflow-y: auto; background: var(--bg); border: 1px solid var(--line);
+    border-radius: 7px; padding: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px; white-space: pre-wrap; word-break: break-word;
+  }
+  .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .note.warn { color: var(--warn); }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+  <h1>KindleFill</h1>
+
+  <div class="card">
+    <div class="status"><span class="dot" id="dot"></span><span id="devline">Looking for a Kindle…</span></div>
+    <div id="devinfo" class="hidden">
+      <div class="row"><span class="k">Storage</span><span class="v" id="d-storage">—</span></div>
+      <div class="row"><span class="k">Capacity</span><span class="v" id="d-total">—</span></div>
+      <div class="row"><span class="k">Free now</span><span class="v" id="d-free">—</span></div>
+      <div class="row"><span class="k">Existing filler</span><span class="v" id="d-filler">—</span></div>
+    </div>
+    <div class="buttons"><button id="refresh">Refresh</button></div>
+  </div>
+
+  <div class="card">
+    <div class="targets">
+      <div><label for="low">Leave at least (MB)</label><input type="number" id="low" value="50" min="1" step="1" /></div>
+      <div><label for="high">…and at most (MB)</label><input type="number" id="high" value="90" min="2" step="1" /></div>
+    </div>
+    <div class="note" id="estimate">—</div>
+    <div class="note warn hidden" id="rangewarn"></div>
+    <div class="buttons">
+      <button class="primary" id="fill" disabled>Fill</button>
+      <button id="stop" disabled>Stop</button>
+      <button id="clean" disabled>Remove Filler</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="bar"><i id="barfill"></i></div>
+    <div class="meta"><span id="p-left">Idle</span><span id="p-right"></span></div>
+    <div id="log" style="margin-top:10px"></div>
+  </div>
+
+<script type="module">
+const { invoke } = window.__TAURI__.core;
+const { listen } = window.__TAURI__.event;
+
+const MB = 1024 * 1024;
+const $ = (id) => document.getElementById(id);
+let device = null, busy = false;
+// Seeded from the measured throughput of a Paperwhite Signature Edition. Replaced by
+// the live rate as soon as the transfer reports one, so it only ever shapes the
+// pre-flight estimate.
+let observedRate = 25.5 * MB;
+
+function log(line) {
+  const el = $('log');
+  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 20;
+  el.textContent += (el.textContent ? '\n' : '') + line;
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
+
+function readWindow() {
+  return { low: Math.round(Number($('low').value) * MB), high: Math.round(Number($('high').value) * MB) };
+}
+
+/// Mirrors Window::MIN_WIDTH in plan.rs. Checked here purely so the problem is visible
+/// before you press Fill; the backend rejects it regardless.
+const MIN_WIDTH = 4 * MB;
+
+function validate() {
+  const { low, high } = readWindow();
+  const warn = $('rangewarn');
+  let msg = '';
+  if (!(low > 0) || !(high > 0)) msg = 'Enter both bounds.';
+  else if (low >= high) msg = 'The lower bound must be below the upper bound.';
+  else if (high - low < MIN_WIDTH) msg = 'That range is too narrow to hit reliably — leave at least 4 MB between them.';
+  warn.textContent = msg;
+  warn.classList.toggle('hidden', !msg);
+  return !msg;
+}
+
+function estimate() {
+  if (!device || !validate()) { $('estimate').textContent = '—'; return; }
+  const { low, high } = readWindow();
+  const aim = low + (high - low) / 2;
+  const toWrite = Math.max(0, device.free - aim);
+  if (toWrite === 0) { $('estimate').textContent = 'Already inside the target window — nothing to write.'; return; }
+  const secs = toWrite / observedRate;
+  const mins = Math.round(secs / 60);
+  const gb = (toWrite / (1024 * 1024 * 1024)).toFixed(2);
+  $('estimate').textContent =
+    `About ${gb} GB to write — roughly ${mins < 1 ? 'under a minute' : mins + ' min'} at ~${(observedRate / MB).toFixed(0)} MB/s.`;
+}
+
+function setBusy(on) {
+  busy = on;
+  $('fill').disabled = on || !device;
+  $('clean').disabled = on || !device;
+  $('refresh').disabled = on;
+  $('stop').disabled = !on;
+  $('low').disabled = on; $('high').disabled = on;
+}
+
+function renderDevice(d) {
+  device = d;
+  $('dot').className = 'dot ' + (d.writable ? 'ok' : 'bad');
+  $('devline').textContent = d.writable ? 'Kindle connected' : 'Kindle connected (storage is read-only)';
+  $('devinfo').classList.remove('hidden');
+  $('d-storage').textContent = d.storage;
+  $('d-total').textContent = d.total_human;
+  $('d-free').textContent = d.free_human;
+  $('d-filler').textContent = d.filler_files
+    ? `${d.filler_files} file${d.filler_files === 1 ? '' : 's'}, ${d.filler_human}`
+    : 'none';
+  $('fill').disabled = !d.writable;
+  $('clean').disabled = d.filler_files === 0;
+  estimate();
+}
+
+async function refresh() {
+  $('refresh').disabled = true;
+  try {
+    renderDevice(await invoke('detect'));
+  } catch (e) {
+    device = null;
+    $('dot').className = 'dot bad';
+    $('devline').textContent = 'No Kindle found';
+    $('devinfo').classList.add('hidden');
+    $('fill').disabled = true; $('clean').disabled = true;
+    log(String(e));
+  } finally {
+    $('refresh').disabled = busy;
+  }
+}
+
+listen('kindlefill://log', (e) => log(e.payload.line));
+
+listen('kindlefill://progress', (e) => {
+  const p = e.payload;
+  $('barfill').style.width = (p.fraction * 100).toFixed(1) + '%';
+  $('p-left').textContent = `${p.percent.toFixed(1)}% — ${p.done_human} of ${p.total_human}`;
+  $('p-right').textContent = `${p.rate_human} · ${p.eta_human} left`;
+});
+
+$('refresh').onclick = refresh;
+for (const id of ['low', 'high']) $(id).oninput = estimate;
+
+$('fill').onclick = async () => {
+  if (!validate()) return;
+  const { low, high } = readWindow();
+  setBusy(true);
+  $('barfill').style.width = '0%';
+  try {
+    log(await invoke('start_fill', { low, high }));
+  } catch (e) {
+    log('Error: ' + String(e));
+  } finally {
+    setBusy(false);
+    await refresh();
+  }
+};
+
+$('stop').onclick = async () => {
+  $('stop').disabled = true;
+  log('Stopping…');
+  await invoke('cancel_fill');
+};
+
+$('clean').onclick = async () => {
+  setBusy(true);
+  try {
+    log(await invoke('start_clean'));
+  } catch (e) {
+    log('Error: ' + String(e));
+  } finally {
+    setBusy(false);
+    $('barfill').style.width = '0%';
+    $('p-left').textContent = 'Idle'; $('p-right').textContent = '';
+    await refresh();
+  }
+};
+
+refresh();
+</script>
+</body>
+</html>

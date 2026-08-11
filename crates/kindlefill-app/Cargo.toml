@@ -1,0 +1,17 @@
+[package]
+name = "kindlefill-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Desktop UI for kindlefill."
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+kindlefill-core = { path = "../kindlefill-core" }
+mtp-rs = { workspace = true }
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

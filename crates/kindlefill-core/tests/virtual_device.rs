@@ -215,6 +215,72 @@ async fn fill_resumes_from_an_existing_partial_fill() {
     }
 }
 
+#[tokio::test]
+async fn a_precancelled_token_writes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let device = open(tmp.path()).await;
+    let mut storage = storage_of(&device).await;
+
+    let before = free_space(&mut storage).await;
+    let cancel = mtp_rs::CancelToken::new();
+    cancel.cancel();
+
+    let outcome = engine::fill_with_cancel(&mut storage, window(), Some(&cancel), |_| {})
+        .await
+        .expect("cancelling is not an error");
+
+    assert!(matches!(outcome, engine::Outcome::Cancelled { .. }));
+    assert_eq!(free_space(&mut storage).await, before, "must not have written");
+}
+
+/// Stopping a 17-minute fill has to leave the device in a state you can pick back up
+/// from — not half-broken, and not needing a clean before you can retry.
+#[tokio::test]
+async fn cancelling_mid_fill_leaves_a_resumable_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let device = open(tmp.path()).await;
+    let mut storage = storage_of(&device).await;
+    let w = window();
+
+    let before = free_space(&mut storage).await;
+    let cancel = mtp_rs::CancelToken::new();
+    let mut written = 0;
+
+    let outcome = engine::fill_with_cancel(&mut storage, w, Some(&cancel), |event| {
+        if matches!(event, engine::Event::Wrote { .. }) {
+            written += 1;
+            if written == 1 {
+                cancel.cancel();
+            }
+        }
+    })
+    .await
+    .expect("cancelling is not an error");
+
+    assert!(matches!(outcome, engine::Outcome::Cancelled { .. }));
+    let mid = free_space(&mut storage).await;
+    assert!(mid < before, "should have made real progress before stopping");
+    assert!(!w.contains(mid), "should have stopped short of the target");
+
+    // The decisive property: a plain re-run finishes the job.
+    let outcome = engine::fill(&mut storage, w, |_| {}).await.expect("resume");
+    assert!(matches!(outcome, engine::Outcome::InWindow { .. }));
+    assert!(w.contains(free_space(&mut storage).await));
+
+    // And no filler was orphaned or duplicated along the way.
+    let dir = engine::find_fill_dir(&storage).await.unwrap().unwrap();
+    let names: Vec<_> = engine::list_fillers(&storage, dir.handle)
+        .await
+        .unwrap()
+        .iter()
+        .map(|f| f.filename.clone())
+        .collect();
+    let mut unique = names.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), names.len(), "duplicate filler: {names:?}");
+}
+
 /// `clean` must never delete something the user put there.
 #[tokio::test]
 async fn clean_leaves_foreign_files_and_their_folder_alone() {

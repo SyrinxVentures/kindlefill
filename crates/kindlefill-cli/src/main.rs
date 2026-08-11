@@ -10,7 +10,7 @@ mod ptpcamerad;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use kindlefill_core::{engine, human_bytes, is_exclusive_access, Event, Window, MIB};
-use mtp_rs::{MtpDevice, NewObjectInfo, ObjectHandle, Storage};
+use mtp_rs::{CancelToken, MtpDevice, NewObjectInfo, ObjectHandle, Storage};
 use std::io::{self, IsTerminal};
 use std::time::Instant;
 
@@ -276,9 +276,24 @@ async fn fill(low: u64, high: u64) -> Result<()> {
     let mut storage = writable_storage(&device).await?;
     let tty = io::stderr().is_terminal();
 
+    // Ctrl-C stops the fill cleanly rather than killing the process mid-object. That
+    // matters: a hard kill leaves a partial object the device still counts against free
+    // space, and nothing would ever delete it.
+    let cancel = CancelToken::new();
+    {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                eprintln!("\nstopping after the current chunk...");
+                cancel.cancel();
+            }
+        });
+    }
+
     let started = Instant::now();
     let mut drew_bar = false;
-    let outcome = engine::fill(&mut storage, window, |event| match event {
+    let outcome = engine::fill_with_cancel(&mut storage, window, Some(&cancel), |event| match event
+    {
         Event::Started { free, aim, total } => println!(
             "starting at {} free, steering to {} — {} to write",
             human_bytes(free),
@@ -324,6 +339,11 @@ async fn fill(low: u64, high: u64) -> Result<()> {
             "overfilled: {} free, {} below target. Run `kindlefill clean` to recover.",
             human_bytes(free),
             human_bytes(excess)
+        ),
+        engine::Outcome::Cancelled { free } => println!(
+            "stopped at {} free. Filler written so far is intact — \
+             re-run `fill` to resume, or `clean` to undo.",
+            human_bytes(free)
         ),
     }
     Ok(())

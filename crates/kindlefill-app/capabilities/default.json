@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Only what the single window needs: invoke commands and receive progress events. No filesystem, shell, or network permissions — the app talks to the Kindle over USB from the Rust side and has no reason to reach anything else.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

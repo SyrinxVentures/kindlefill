@@ -9,7 +9,7 @@
 use crate::plan::{next_step, Step, Window};
 use crate::rate::{FillProgress, RateEstimator};
 use crate::zeros::ZeroStream;
-use mtp_rs::{Error, NewObjectInfo, ObjectHandle, ObjectInfo, Storage};
+use mtp_rs::{CancelToken, Error, NewObjectInfo, ObjectHandle, ObjectInfo, Storage};
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
@@ -50,6 +50,9 @@ pub enum Outcome {
     /// deleting filler — surfaced rather than silently "fixed" because the excess
     /// may be the device's own doing, not ours.
     Overfilled { free: u64, excess: u64 },
+    /// The caller cancelled. Not an error: the filler written so far is intact and
+    /// valid, and re-running `fill` resumes from it.
+    Cancelled { free: u64 },
 }
 
 #[derive(Debug)]
@@ -156,6 +159,27 @@ fn next_sequence(existing: &[ObjectInfo]) -> u32 {
 pub async fn fill<F>(
     storage: &mut Storage,
     window: Window,
+    on_event: F,
+) -> Result<Outcome, FillError>
+where
+    F: FnMut(Event) + Send,
+{
+    fill_with_cancel(storage, window, None, on_event).await
+}
+
+/// Like [`fill`], but abortable.
+///
+/// A full fill is a ~17-minute operation on a 32 GB device, so any UI driving it needs
+/// a working Stop button — and one that stops in a second, not at the end of the
+/// current object. Cancellation is therefore checked inside the upload's own progress
+/// callback, not merely between objects: a 1 GiB write is ~40 seconds on its own.
+///
+/// Stopping is safe at any point. The half-written object is deleted, everything
+/// already committed stays valid, and a later `fill` resumes from it.
+pub async fn fill_with_cancel<F>(
+    storage: &mut Storage,
+    window: Window,
+    cancel: Option<&CancelToken>,
     mut on_event: F,
 ) -> Result<Outcome, FillError>
 where
@@ -190,6 +214,10 @@ where
 
     loop {
         let free = measure(storage).await?;
+        if cancel.is_some_and(CancelToken::is_cancelled) {
+            on_event(Event::Finished { free });
+            return Ok(Outcome::Cancelled { free });
+        }
         match next_step(free, window) {
             Step::Done => {
                 on_event(Event::Finished { free });
@@ -224,6 +252,11 @@ where
                             NewObjectInfo::file(&name, bytes),
                             ZeroStream::new(bytes),
                             move |p| {
+                                // Checked here rather than only between objects so Stop
+                                // responds within a chunk instead of up to ~40s later.
+                                if cancel.is_some_and(CancelToken::is_cancelled) {
+                                    return ControlFlow::Break(());
+                                }
                                 let now = Instant::now();
                                 rate.observe(
                                     p.bytes_transferred.saturating_sub(last_sample.1),
@@ -255,6 +288,14 @@ where
                     // it would consume space that no `clean` run could find.
                     if let Some(partial) = e.partial {
                         let _ = storage.delete(partial).await;
+                    }
+                    // Breaking out of the progress callback surfaces here as Cancelled.
+                    // That's a deliberate stop, not a failure: the partial object is
+                    // already gone and everything committed before it is still good.
+                    if matches!(e.source, Error::Cancelled) {
+                        let free = measure(storage).await?;
+                        on_event(Event::Finished { free });
+                        return Ok(Outcome::Cancelled { free });
                     }
                     return Err(FillError::Mtp(e.source));
                 }

@@ -19,7 +19,9 @@ pub mod plan;
 pub mod rate;
 pub mod zeros;
 
-pub use engine::{clean, fill, find_fill_dir, list_fillers, Event, FillError, Outcome, FILL_DIR};
+pub use engine::{
+    clean, fill, fill_with_cancel, find_fill_dir, list_fillers, Event, FillError, Outcome, FILL_DIR,
+};
 pub use plan::{next_step, Step, Window, WindowError, GIB, KIB, MIB};
 pub use rate::{human_duration, FillProgress, RateEstimator};
 pub use zeros::ZeroStream;

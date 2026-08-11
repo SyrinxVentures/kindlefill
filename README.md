@@ -1,4 +1,4 @@
-# KindleFiller
+# KindleFill
 
 Fills a Kindle's storage down to a target free-space window (default 50–90 MB) so the
 device can't download an OTA firmware update, and removes the filler again afterwards.
@@ -9,12 +9,28 @@ the stack is portable but untested elsewhere.
 
 ## Status
 
-`kindlefill-core` is written and tested. **Nothing has been run against a real Kindle
-yet.** The `probe` and `bench` commands exist to close that gap — see
-[Validating against hardware](#validating-against-hardware).
+Validated against a **Kindle Paperwhite Signature Edition** (25.46 GB usable) on macOS.
+Every assumption the design rested on held:
 
-The Tauri GUI is not built yet, deliberately: two of its design decisions depend on
-what `bench` reports.
+| Question | Answer |
+|---|---|
+| Does the device enumerate over MTP? | Yes — no driver, no helper app |
+| Does `ptpcamerad` need working around? | **It wasn't running at all** — no admin prompt needed |
+| Does reported free space track writes? | **Exactly.** 16/128/512 MiB writes each moved it by precisely that much |
+| Per-file overhead | 0 bytes at 16 and 128 MiB; one 4 KB block at 512 MiB |
+| Throughput | 25–30 MB/s, settling near 25.5 MB/s on large objects |
+
+That last row puts a full fill on a 32 GB Kindle at roughly **17 minutes**.
+
+The free-space result is the one that mattered. It was the single assumption that could
+have invalidated the whole approach — a device caching `GetStorageInfo` would leave the
+measure-write-remeasure loop unable to converge, and it would have passed every test in
+this repo before failing on the cable. It doesn't cache. The stray 4 KB block is exactly
+the kind of overhead the loop absorbs by measuring instead of tallying.
+
+**The GUI has not been run.** Its backend is type-checked and the workspace builds, but
+it was developed on Linux where a Tauri window can't be opened — treat first launch as
+unverified.
 
 ## Why this isn't just "copy some big files over"
 
@@ -26,8 +42,12 @@ PTP, so it can't talk to a Kindle; it just stops anything else from doing so. Th
 kills it repeatedly for the duration of a transfer and lets launchd restart it after,
 rather than disabling it permanently and quietly breaking camera import.
 
-**Landing in the window is a control problem, not arithmetic.** 50–90 MB on a 16 GB
-device is a 0.25% target, and every file costs more than its own bytes in ways the host
+It didn't turn out to be running on the machine this was validated on, so the handling
+is defensive rather than load-bearing — but it costs nothing when idle, and the failure
+it prevents is otherwise a baffling permission error with no obvious cause.
+
+**Landing in the window is a control problem, not arithmetic.** A 40 MB window on a
+25 GB device is a 0.16% target, and every file costs more than its own bytes in ways the host
 can't predict. So the loop measures, writes, and re-measures — never tallies. See
 `plan.rs`.
 
@@ -37,11 +57,29 @@ size still crosses the USB wire. Nothing can shortcut that: MTP has no compresse
 transfer mode, and making the Kindle expand an archive needs code execution on the
 device — exactly what you don't have before jailbreaking.
 
-We do avoid the ZIP workflow's other costs. It writes ~13 GB to your SSD and reads it
-back, and needs that much free space locally. This generates zeros in memory and
-streams them straight into the upload.
+We do avoid the ZIP workflow's other costs. It expands the archive onto your SSD and
+reads it all back to send — on a 32 GB Kindle that's ~25 GB written and ~25 GB read
+locally, and you need the space free to begin with. This generates zeros in memory and
+streams them straight into the upload, so the host never stores a byte.
 
-## Usage
+## The app
+
+```bash
+cargo run -p kindlefill-app          # run it
+cargo tauri build                    # build a .app / .dmg (needs `cargo install tauri-cli`)
+```
+
+The frontend is a single static HTML file with no framework and no build step, so
+`cargo run` is enough — there's no dev server to start first.
+
+It shows the connected device, capacity, free space, and any filler already present;
+lets you set the target window; estimates the transfer up front; and runs the fill with
+a live bar, throughput, and ETA. **Stop** is wired to a real cancel token — checked
+inside the upload rather than only between objects, so it responds in about a second
+rather than up to 40. Stopping is safe: the half-written object is deleted, everything
+committed stays valid, and pressing Fill again resumes.
+
+## CLI
 
 ```bash
 cargo run -p kindlefill-cli -- probe     # what do we see? changes nothing
@@ -55,7 +93,7 @@ cargo run -p kindlefill-cli -- clean     # remove all filler
 `fill` renders a live progress bar with throughput and ETA:
 
 ```
-  [############--------------------] 37.4% | 4.88 GB / 13.04 GB | 18.2 MB/s | 7m 42s left
+  [############--------------------] 37.4% | 9.31 GB / 24.88 GB | 25.5 MB/s | 10m 26s left
 ```
 
 It falls back to plain lines when output isn't a terminal, so piping to a log stays
@@ -69,9 +107,10 @@ on filenames.
 `clean` only deletes files matching its own `fill_NNNN.bin` naming, and only removes
 `fill_disk` if nothing else is in it — a book dropped in that folder survives.
 
-## Validating against hardware
+## Re-validating against hardware
 
-Run `probe` and `bench` with the Kindle attached. Two results decide open questions:
+`probe` and `bench` answered the two questions that gated the design, and stay useful
+for checking a different Kindle model:
 
 1. **Does `pkill ptpcamerad` work without sudo?** `probe` answers this by trying. If it
    needs elevation, the GUI needs an admin prompt or a privileged helper — a
@@ -93,6 +132,7 @@ crates/kindlefill-core/    plan.rs    pure convergence logic, no I/O
                           zeros.rs   synthetic byte source for uploads
                           engine.rs  drives a real mtp_rs::Storage
 crates/kindlefill-cli/     probe / bench / status / fill / clean
+crates/kindlefill-app/     Tauri desktop UI (static HTML frontend, no build step)
 ```
 
 `plan.rs` is I/O-free so the hard part is testable without a Kindle. `engine.rs` is
@@ -100,11 +140,12 @@ covered end-to-end in `tests/virtual_device.rs` against `mtp-rs`'s virtual devic
 which is backed by a real directory and reports free space from actual disk usage — so
 the convergence loop is exercised for real, per-file overhead included.
 
-That suite can't prove a Kindle refreshes free space promptly. A device that cached it
-would pass every test here and hang on the cable. Hence `bench`.
+That suite can't prove a Kindle refreshes free space promptly — a device that cached it
+would pass every test here and hang on the cable. That's what `bench` is for, and on a
+Paperwhite Signature Edition it came back exact.
 
 ```bash
-cargo test      # 34 tests, no hardware required
+cargo test      # 36 tests, no hardware required
 ```
 
 ## License

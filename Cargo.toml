@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/kindlefill-core", "crates/kindlefill-cli"]
+members = ["crates/kindlefill-core", "crates/kindlefill-cli", "crates/kindlefill-app"]
 resolver = "2"
 
 [workspace.package]

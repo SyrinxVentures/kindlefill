@@ -1,0 +1,19 @@
+[workspace]
+members = ["crates/kindlefill-core", "crates/kindlefill-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# Matches mtp-rs and the Rust ecosystem default. Apache-2.0 carries the explicit
+# patent grant; MIT is the shorter, more universally recognized option. Downstream
+# users take whichever their situation calls for.
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/avrignaud/kindlefill"
+
+[workspace.dependencies]
+mtp-rs = "0.30"
+bytes = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+anyhow = "1"

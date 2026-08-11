@@ -1,0 +1,18 @@
+[package]
+name = "kindlefill-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Diagnostics and command-line driver for kindlefill."
+
+[[bin]]
+name = "kindlefill"
+path = "src/main.rs"
+
+[dependencies]
+kindlefill-core = { path = "../kindlefill-core" }
+mtp-rs = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }

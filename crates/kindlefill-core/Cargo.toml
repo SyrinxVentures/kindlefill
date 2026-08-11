@@ -1,0 +1,17 @@
+[package]
+name = "kindlefill-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Fill a Kindle's MTP storage to a target free-space window, and undo it."
+
+[dependencies]
+mtp-rs = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+mtp-rs = { workspace = true, features = ["virtual-device"] }
+tokio = { workspace = true }
+tempfile = "3"

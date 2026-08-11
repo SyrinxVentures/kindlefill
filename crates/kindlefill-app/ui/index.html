@@ -198,8 +198,10 @@
       </div>
 
       <div id="dirbox" class="hidden" style="margin-top:12px">
-        <label for="dirname">Folder name, at the storage root</label>
-        <input type="text" id="dirname" value="fill_disk" spellcheck="false" autocapitalize="off" />
+        <label for="dirname">Folder name, at the storage root — press Enter to use it</label>
+        <input type="text" id="dirname" value="fill_disk" spellcheck="false" autocapitalize="off"
+               autocomplete="off" enterkeyhint="done" />
+        <div class="note warn hidden" id="dirwarn" role="alert"></div>
       </div>
     </div>
     <div class="buttons">
@@ -411,6 +413,18 @@ function renderDevice(d) {
 // exclusive access. A detect requested during one is folded into a single re-run after.
 let detecting = false, detectAgain = false;
 
+/// One painter for "there is no usable device", so the unplug watcher and a failed
+/// detect can't drift into describing the same state two different ways.
+function showNoDevice(line) {
+  device = null;
+  $('dot').className = 'dot bad';
+  $('devline').textContent = line;
+  $('devinfo').classList.add('hidden');
+  $('updatewarn').classList.add('hidden');
+  $('fill').disabled = true;
+  $('clean').disabled = true;
+}
+
 async function refresh() {
   if (detecting) { detectAgain = true; return; }
   detecting = true;
@@ -422,12 +436,7 @@ async function refresh() {
   try {
     renderDevice(await invoke('detect', { dirName: dirName() }));
   } catch (e) {
-    device = null;
-    $('dot').className = 'dot bad';
-    $('devline').textContent = 'No Kindle found';
-    $('devinfo').classList.add('hidden');
-    $('updatewarn').classList.add('hidden');
-    $('fill').disabled = true; $('clean').disabled = true;
+    showNoDevice('No Kindle found');
     log(String(e));
   } finally {
     $('refresh').disabled = busy;
@@ -452,19 +461,59 @@ listen('kindlefill://progress', (e) => {
 $('refresh').onclick = refresh;
 for (const id of ['low', 'high']) $(id).oninput = estimate;
 
-$('rename').onclick = () => {
-  const box = $('dirbox');
-  const shown = box.classList.toggle('hidden') === false;
+/// Mirrors validate_dir_name in engine.rs. Checked here so a bad name says so in
+/// place, rather than travelling to the backend and coming back as a failed detect —
+/// which the catch would have rendered as "No Kindle found", blaming the cable for a
+/// typo.
+function dirNameError(name) {
+  if (!name) return 'Enter a folder name.';
+  if (name !== name.trim()) return 'No leading or trailing spaces.';
+  if (/^\.+$/.test(name)) return 'That name is just dots.';
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f/\\:*?"<>|]/.test(name)) return 'Use letters, digits, spaces, dot, dash or underscore.';
+  return '';
+}
+
+function setDirBox(shown) {
+  $('dirbox').classList.toggle('hidden', !shown);
   $('rename').setAttribute('aria-expanded', String(shown));
+  $('rename').textContent = shown ? 'Done' : 'Change folder…';
   if (shown) $('dirname').focus();
+}
+
+/// Commit the typed name: re-read the device against it, because which folder we are
+/// looking at decides existing filler, foreign content, and whether Fill is safe.
+let appliedDir = DEFAULT_DIR;
+async function applyDirName() {
+  clearTimeout(dirDebounce);
+  const name = $('dirname').value;
+  const err = dirNameError(name);
+  $('dirwarn').textContent = err;
+  $('dirwarn').classList.toggle('hidden', !err);
+  if (err || busy || name === appliedDir) return;
+  appliedDir = name;
+  await refresh();
+}
+
+$('rename').onclick = async () => {
+  const opening = $('dirbox').classList.contains('hidden');
+  if (!opening) await applyDirName();
+  setDirBox(opening);
 };
 
-// Changing the name changes which folder we're looking at, so the whole picture —
-// existing filler, foreign content — has to be re-read before Fill means anything.
+$('dirname').onkeydown = async (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); await applyDirName(); if (!dirNameError($('dirname').value)) setDirBox(false); }
+  if (e.key === 'Escape') { e.preventDefault(); $('dirname').value = appliedDir; $('dirwarn').classList.add('hidden'); setDirBox(false); }
+};
+
+// Committing on blur too, so clicking away isn't a silent way to lose the edit.
+$('dirname').onblur = () => { applyDirName(); };
+
+// A slow fallback for anyone who types and waits rather than pressing Enter.
 let dirDebounce;
 $('dirname').oninput = () => {
   clearTimeout(dirDebounce);
-  dirDebounce = setTimeout(() => { if (!busy) refresh(); }, 400);
+  dirDebounce = setTimeout(applyDirName, 900);
 };
 
 $('overwrite').onchange = () => {
@@ -542,6 +591,32 @@ $('clean').onclick = async () => {
     await refresh();
   }
 };
+
+/// Watch the cable. `detect` opens the device, so it is far too heavy to run on a
+/// timer and outright impossible while a fill holds it; `device_present` only
+/// enumerates USB. Without this the header sat on "Kindle connected" indefinitely
+/// after an unplug, because nothing repainted it until the next manual Refresh.
+///
+/// Skipped while busy: an operation in flight surfaces a disconnect as its own error
+/// within a second or two, and that path has the better message.
+const PRESENCE_POLL_MS = 2000;
+setInterval(async () => {
+  if (busy || detecting) return;
+  let present;
+  try {
+    present = await invoke('device_present');
+  } catch {
+    return; // transient IPC failure is not evidence the cable came out
+  }
+  if (present === !!device) return;
+  if (present) {
+    log('Kindle reconnected.');
+    await refresh();
+  } else {
+    showNoDevice('Kindle unplugged');
+    log('Kindle unplugged.');
+  }
+}, PRESENCE_POLL_MS);
 
 refresh();
 </script>

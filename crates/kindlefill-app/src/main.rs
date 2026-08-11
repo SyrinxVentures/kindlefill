@@ -461,6 +461,17 @@ async fn start_clean(
     Ok(format!("Filler removed — {} free.", human_bytes(free)))
 }
 
+/// Is a device on the bus at all?
+///
+/// Deliberately not `detect`: this only enumerates USB, so it never opens the Kindle,
+/// never starts a `ptpcamerad` tamer, and is safe to call on a timer. Opening the
+/// device to answer "is the cable still in?" would be both wasteful and impossible
+/// during a fill, which is exactly when the answer matters.
+#[tauri::command]
+fn device_present() -> bool {
+    MtpDevice::list_devices().is_ok_and(|d| !d.is_empty())
+}
+
 #[tauri::command]
 fn cancel_fill(state: State<'_, AppState>) {
     if let Some(token) = state.cancel.lock().unwrap().as_ref() {
@@ -490,6 +501,7 @@ fn main() {
             start_fill,
             start_clean,
             delete_updates,
+            device_present,
             cancel_fill
         ])
         .run(tauri::generate_context!())

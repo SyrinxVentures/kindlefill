@@ -60,6 +60,20 @@ It didn't turn out to be running on the machine this was validated on, so the ha
 is defensive rather than load-bearing — but it costs nothing when idle, and the failure
 it prevents is otherwise a baffling permission error with no obvious cause.
 
+**Fill converges from either side.** Writing can only ever reduce free space, so a
+device that ends up *under* the target — because you moved the window, or the Kindle
+grew its own files — used to be stuck: the only remedy was deleting every filler
+object and starting over, seventeen minutes to gain a few megabytes. Below the window,
+`fill` now removes filler instead, then writes back down.
+
+Deleting alone isn't enough, which is why it's one loop rather than a separate
+"trim" command. Filler is written in coarse rungs, so on a real 25 GB device the
+smallest object may be 64 MiB while the window is 20 MB wide — removing one takes you
+from 87 MB free to 154 MB, straight past the target. So a removal deliberately
+overshoots and the ladder converges back down. It can't oscillate: `next_step` never
+proposes a write that lands below `low`, so once a removal reaches the window, writes
+can't push back under it. `plan.rs` has that as a property test.
+
 **Landing in the window is a control problem, not arithmetic.** A 40 MB window on a
 25 GB device is a 0.16% target, and every file costs more than its own bytes in ways the host
 can't predict. So the loop measures, writes, and re-measures — never tallies. See
@@ -244,7 +258,7 @@ would pass every test here and hang on the cable. That's what `bench` is for, an
 Paperwhite Signature Edition it came back exact.
 
 ```bash
-cargo test      # 42 tests, no hardware required
+cargo test      # 58 tests, no hardware required
 ```
 
 ## License

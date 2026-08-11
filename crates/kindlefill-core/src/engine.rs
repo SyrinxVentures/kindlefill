@@ -6,7 +6,7 @@
 //! Deciding the next write from the cached value would loop forever or overshoot,
 //! and it would look fine in every test that didn't use a real device.
 
-use crate::plan::{next_step, Step, Window};
+use crate::plan::{next_removal, next_step, Removal, Step, Window};
 use crate::rate::{FillProgress, RateEstimator};
 use crate::zeros::ZeroStream;
 use mtp_rs::{CancelToken, Error, NewObjectInfo, ObjectHandle, ObjectInfo, Storage};
@@ -473,16 +473,24 @@ where
     }
 
     let free_start = measure(storage).await?;
-    if free_start < window.low() {
+    if free_start < window.low()
+        && match find_fill_dir(storage, dir_name).await? {
+            Some(dir) => list_fillers(storage, dir.handle).await?.is_empty(),
+            None => true,
+        }
+    {
+        // Below the target with no filler of ours to remove: the space belongs to
+        // something else, and nothing this tool can do will free it.
         return Err(FillError::AlreadyBelowWindow {
             free: free_start,
             low: window.low(),
         });
     }
 
-    // What the job set out to move. Measured against `aim`, not `high`, because that's
-    // where the loop actually steers.
-    let total = free_start.saturating_sub(window.aim());
+    // What the job set out to move, in whichever direction it has to go: `abs_diff`
+    // because a fill that starts *below* the window climbs toward the aim by deleting
+    // rather than descending toward it by writing.
+    let total = free_start.abs_diff(window.aim());
     on_event(Event::Started {
         free: free_start,
         aim: window.aim(),
@@ -508,17 +516,38 @@ where
                 return Ok(Outcome::InWindow { free });
             }
             Step::Overfilled { free, excess } => {
-                on_event(Event::Finished { free });
-                return Ok(Outcome::Overfilled { free, excess });
+                // Below the window: give space back rather than giving up. Only ever
+                // filler this tool wrote, chosen by `next_removal`, and the loop then
+                // re-measures exactly as it does after a write.
+                let fillers = list_fillers(storage, dir).await?;
+                let sizes: Vec<u64> = fillers.iter().map(|f| f.size).collect();
+                match next_removal(free, window, &sizes) {
+                    Removal::Remove(i) => {
+                        let victim = &fillers[i];
+                        storage.delete(victim.handle).await?;
+                        on_event(Event::Deleted {
+                            name: victim.filename.clone(),
+                            bytes: victim.size,
+                        });
+                        continue;
+                    }
+                    // Nothing of ours left to give back; the shortfall isn't ours.
+                    Removal::Exhausted => {
+                        on_event(Event::Finished { free });
+                        return Ok(Outcome::Overfilled { free, excess });
+                    }
+                }
             }
             Step::Write(bytes) => {
                 let name = format!("{FILL_PREFIX}{seq:04}{FILL_SUFFIX}");
 
                 // Ground truth for everything already committed, taken from the device
-                // rather than from a tally. In-object progress is added on top and then
-                // discarded — the next iteration re-derives this from a fresh reading,
-                // so a drifting estimate can never accumulate.
-                let committed = free_start.saturating_sub(free);
+                // rather than from a tally: how much closer to the aim we are than when
+                // we started. In-object progress is added on top and then discarded —
+                // the next iteration re-derives this from a fresh reading, so a drifting
+                // estimate can never accumulate. Reduces to `free_start - free` for the
+                // ordinary downward fill.
+                let committed = total.saturating_sub(free.abs_diff(window.aim()));
 
                 let upload = {
                     let now = Instant::now();

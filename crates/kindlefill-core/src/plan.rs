@@ -156,6 +156,69 @@ pub fn next_step(free: u64, window: Window) -> Step {
     Step::Write(size.min(max_safe).max(1))
 }
 
+/// Which filler object to give back when free space is *below* the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Removal {
+    /// Delete the object at this index of the slice passed in.
+    Remove(usize),
+    /// Below the window with nothing of ours left to remove. Not recoverable by this
+    /// tool — the space is someone else's.
+    Exhausted,
+}
+
+/// Pick the filler object to delete to climb back toward the window.
+///
+/// The counterpart to [`next_step`], and the reason a fill can converge from either
+/// side. Writing can only ever reduce free space, so a device that ends up *under* the
+/// target — because the window moved, or the Kindle grew its own files — was
+/// previously stuck: the only remedy was deleting all the filler and starting over,
+/// seventeen minutes to gain a few megabytes.
+///
+/// Preference order, and the middle one is the point:
+///
+/// 1. An object that lands us *inside* the window outright — no rewriting needed.
+/// 2. Otherwise the **smallest** object that reaches `low`. It overshoots past `high`,
+///    and the ladder then writes back down. That indirection is unavoidable: filler is
+///    written in coarse rungs, so on a real device the smallest object may be 64 MiB
+///    while the window is 20 MB wide. Deleting is never enough on its own.
+/// 3. Otherwise the largest available, which at least makes progress.
+///
+/// Termination rests on [`next_step`] never proposing a write that lands below `low`.
+/// Once a removal carries us to or above `low`, writes converge downward and cannot
+/// re-enter this branch, so removals can't alternate with writes. Each removal also
+/// strictly increases free space, and the filler set is finite.
+#[must_use]
+pub fn next_removal(free: u64, window: Window, sizes: &[u64]) -> Removal {
+    if sizes.is_empty() {
+        return Removal::Exhausted;
+    }
+    // 1. Lands inside the window: prefer whichever ends up nearest the aim.
+    let inside = sizes
+        .iter()
+        .enumerate()
+        .filter(|(_, &s)| window.contains(free.saturating_add(s)))
+        .min_by_key(|(_, &s)| free.saturating_add(s).abs_diff(window.aim()));
+    if let Some((i, _)) = inside {
+        return Removal::Remove(i);
+    }
+    // 2. Smallest that at least reaches the window, accepting the overshoot.
+    let reaches = sizes
+        .iter()
+        .enumerate()
+        .filter(|(_, &s)| free.saturating_add(s) >= window.low())
+        .min_by_key(|(_, &s)| s);
+    if let Some((i, _)) = reaches {
+        return Removal::Remove(i);
+    }
+    // 3. Nothing reaches it; take the biggest bite available.
+    let (i, _) = sizes
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, &s)| s)
+        .expect("non-empty");
+    Removal::Remove(i)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +352,82 @@ mod tests {
             count += 1;
         }
         assert!(count < 40, "took {count} objects to fill 13 GiB; too chatty");
+    }
+
+    #[test]
+    fn nothing_to_remove_is_a_terminal_state_not_an_index() {
+        assert_eq!(next_removal(10 * MIB, window(), &[]), Removal::Exhausted);
+    }
+
+    #[test]
+    fn prefers_a_removal_that_lands_inside_the_window_outright() {
+        let w = window(); // 50-90 MiB, aim 70
+        // From 40 MiB free: +32 lands on 72, +45 lands on 85. Both are inside; 72 is
+        // nearer the aim, so it wins.
+        let sizes = [4 * MIB, 32 * MIB, 45 * MIB, GIB];
+        assert_eq!(next_removal(40 * MIB, w, &sizes), Removal::Remove(1));
+    }
+
+    /// The case a real device produced: 87 MB free, wanting ~80, and the smallest
+    /// object on the device is 64 MiB. Nothing lands inside the window, so the
+    /// smallest that reaches it is taken and the ladder writes back down.
+    #[test]
+    fn overshoots_with_the_smallest_object_when_none_lands_inside() {
+        let w = Window::new(75 * MIB, 85 * MIB).unwrap();
+        let sizes = [GIB, 256 * MIB, 64 * MIB, 64 * MIB];
+        // 20 MiB free: every option overshoots past 85, so take a 64 MiB one.
+        match next_removal(20 * MIB, w, &sizes) {
+            Removal::Remove(i) => assert_eq!(sizes[i], 64 * MIB, "took {} MiB", sizes[i] / MIB),
+            other => panic!("expected a removal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn takes_the_largest_when_nothing_reaches_the_window() {
+        let w = window();
+        let sizes = [MIB, 4 * MIB, 2 * MIB];
+        // 1 MiB free; even +4 MiB is far below the 50 MiB floor. Biggest bite.
+        assert_eq!(next_removal(MIB, w, &sizes), Removal::Remove(1));
+    }
+
+    /// The property the bidirectional loop depends on: from anywhere below the window,
+    /// alternating removals and writes reaches the window in bounded steps and never
+    /// oscillates. A write can't drop us back under `low`, so the removal branch is
+    /// entered only before the first write.
+    #[test]
+    fn converges_from_below_the_window_without_oscillating() {
+        let w = Window::new(75 * MIB, 85 * MIB).unwrap();
+        for start in [0, MIB, 20 * MIB, 74 * MIB] {
+            let mut sizes = vec![GIB, 256 * MIB, 64 * MIB, 64 * MIB, 16 * MIB];
+            let mut free = start;
+            let (mut removals, mut writes) = (0, 0);
+            loop {
+                if w.contains(free) {
+                    break;
+                }
+                if free < w.low() {
+                    assert_eq!(writes, 0, "removal after a write means oscillation");
+                    match next_removal(free, w, &sizes) {
+                        Removal::Remove(i) => {
+                            free += sizes.remove(i);
+                            removals += 1;
+                        }
+                        Removal::Exhausted => panic!("ran out of filler from {start}"),
+                    }
+                } else {
+                    match next_step(free, w) {
+                        Step::Write(n) => {
+                            free -= n;
+                            writes += 1;
+                        }
+                        Step::Done => break,
+                        other => panic!("unexpected {other:?}"),
+                    }
+                }
+                assert!(removals + writes < 100, "not converging from {start}");
+            }
+            assert!(w.contains(free), "from {start} landed at {free}");
+        }
     }
 
     #[test]

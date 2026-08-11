@@ -300,8 +300,21 @@ function estimate() {
   if (!device || !validate()) { $('estimate').textContent = '—'; return; }
   const { low, high } = readWindow();
   const aim = low + (high - low) / 2;
+  if (device.free >= low && device.free <= high) {
+    $('estimate').textContent = 'Already inside the target window — nothing to do.';
+    return;
+  }
+  // Below the window, Fill goes the other way: it removes filler to free space, then
+  // writes smaller objects back down into the window. Worth saying, because a button
+  // called Fill that starts deleting is otherwise a surprise.
+  if (device.free < low) {
+    const toFree = ((low + high) / 2 - device.free) / MB;
+    $('estimate').textContent =
+      `${toFree.toFixed(0)} MB below the target — Fill will remove filler to free space, ` +
+      `then top back up. Takes seconds.`;
+    return;
+  }
   const toWrite = Math.max(0, device.free - aim);
-  if (toWrite === 0) { $('estimate').textContent = 'Already inside the target window — nothing to write.'; return; }
   const secs = toWrite / observedRate;
   const mins = Math.round(secs / 60);
   const gb = (toWrite / (1024 * 1024 * 1024)).toFixed(2);

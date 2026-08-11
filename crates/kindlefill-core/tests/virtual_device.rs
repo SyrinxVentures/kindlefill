@@ -616,3 +616,78 @@ async fn cleaning_the_wrong_folder_reports_that_it_removed_nothing() {
     assert!(report.removed > 0 && report.bytes > 0, "{report:?}");
     assert!(free_space(&mut storage).await > before);
 }
+
+/// The gap a real device exposed: filled to 87 MB free, wanting 80, and the smallest
+/// filler object is far wider than the window. Writing can only reduce free space, so
+/// before this the only remedy was deleting everything and refilling — seventeen
+/// minutes to gain a few megabytes. Fill now converges from below too.
+#[tokio::test]
+async fn fill_climbs_back_up_when_it_starts_below_the_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let device = open(tmp.path()).await;
+    let mut storage = storage_of(&device).await;
+
+    // Land somewhere first, then ask for a window well *above* where we ended up.
+    engine::fill(&mut storage, window(), DIR, |_| {}).await.expect("fill");
+    let low = free_space(&mut storage).await;
+    assert!(window().contains(low));
+
+    let higher = Window::new(low + 8 * MIB, low + 16 * MIB).unwrap();
+    let outcome = engine::fill(&mut storage, higher, DIR, |_| {})
+        .await
+        .expect("second fill");
+
+    match outcome {
+        engine::Outcome::InWindow { free } => {
+            assert!(higher.contains(free), "landed at {free}, outside {higher:?}")
+        }
+        other => panic!("expected InWindow, got {other:?}"),
+    }
+    // And the device agrees, independently of what fill reported.
+    assert!(higher.contains(free_space(&mut storage).await));
+}
+
+/// Climbing up must delete filler and nothing else.
+#[tokio::test]
+async fn climbing_up_removes_only_filler_and_leaves_foreign_files_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let device = open(tmp.path()).await;
+    let mut storage = storage_of(&device).await;
+
+    engine::fill(&mut storage, window(), DIR, |_| {}).await.expect("fill");
+    let dir = engine::find_fill_dir(&storage, DIR).await.unwrap().unwrap();
+    put(&storage, dir.handle, "mybook.azw3", 1024).await;
+    put(&storage, dir.handle, "fill_notes.bin", 1024).await;
+    put(&storage, ObjectHandle::ROOT, "root_book.azw3", 1024).await;
+
+    let low = free_space(&mut storage).await;
+    let higher = Window::new(low + 8 * MIB, low + 16 * MIB).unwrap();
+    engine::fill(&mut storage, higher, DIR, |_| {}).await.expect("climb");
+
+    let survivors: Vec<String> = engine::list_foreign(&storage, dir.handle)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|o| o.filename)
+        .collect();
+    assert!(survivors.contains(&"mybook.azw3".to_string()), "{survivors:?}");
+    assert!(survivors.contains(&"fill_notes.bin".to_string()), "{survivors:?}");
+    assert!(root_names(&storage).await.contains(&"root_book.azw3".to_string()));
+}
+
+/// Below the window with no filler of ours is genuinely unfixable, and must still say
+/// so rather than silently doing nothing.
+#[tokio::test]
+async fn below_the_window_with_nothing_of_ours_to_remove_is_still_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let device = open(tmp.path()).await;
+    let mut storage = storage_of(&device).await;
+
+    let bulk = CAPACITY - 4 * MIB;
+    put(&storage, ObjectHandle::ROOT, "bulk.bin", bulk).await;
+
+    match engine::fill(&mut storage, window(), DIR, |_| {}).await {
+        Err(engine::FillError::AlreadyBelowWindow { .. }) => {}
+        other => panic!("expected AlreadyBelowWindow, got {other:?}"),
+    }
+}

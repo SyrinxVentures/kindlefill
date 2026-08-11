@@ -18,12 +18,70 @@ use std::time::{Duration, Instant};
 /// Tauri bridge should carry.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Folder we put filler in. Matches the convention the Kindle modding guides use, so
-/// a folder left by another tool is recognized and topped up rather than duplicated.
-pub const FILL_DIR: &str = "fill_disk";
+/// Default folder we put filler in. Matches the convention the Kindle modding guides
+/// use, so a folder left by another tool is recognized and topped up rather than
+/// duplicated. Configurable because that same convention means the folder may already
+/// exist holding something that isn't ours.
+pub const DEFAULT_FILL_DIR: &str = "fill_disk";
 
 const FILL_PREFIX: &str = "fill_";
 const FILL_SUFFIX: &str = ".bin";
+
+/// Prefix and suffix of a staged over-the-air firmware image.
+///
+/// The Kindle downloads an update to the storage root as `update_*.bin` and installs
+/// it on the next restart. Filling around one accomplishes nothing — the bytes are
+/// already on the device — which is why this is worth detecting before a 17-minute
+/// transfer rather than after.
+const UPDATE_PREFIX: &str = "update_";
+const UPDATE_SUFFIX: &str = ".bin";
+
+/// Why a folder name can't be used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NameError {
+    Empty,
+    /// Contains a character that isn't a filename, or a leading/trailing space that
+    /// would make the folder impossible to identify on the device.
+    Illegal { name: String },
+}
+
+impl std::fmt::Display for NameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NameError::Empty => write!(f, "the folder name can't be empty"),
+            NameError::Illegal { name } => write!(
+                f,
+                "{name:?} isn't a usable folder name — use letters, digits, spaces, \
+                 dot, dash or underscore, and no leading or trailing space"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NameError {}
+
+/// Check a folder name before it reaches the device.
+///
+/// A path separator here would be the difference between creating one folder at the
+/// root and walking somewhere else entirely, so it's rejected rather than sanitized —
+/// silently rewriting a name the user typed would leave them looking for a folder
+/// that isn't there.
+pub fn validate_dir_name(name: &str) -> Result<(), NameError> {
+    if name.is_empty() {
+        return Err(NameError::Empty);
+    }
+    let illegal = name != name.trim()
+        || name.chars().all(|c| c == '.')
+        || name
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'));
+    if illegal {
+        return Err(NameError::Illegal {
+            name: name.to_string(),
+        });
+    }
+    Ok(())
+}
 
 /// Emitted as work happens so a UI can show progress without polling.
 #[derive(Debug, Clone)]
@@ -62,6 +120,8 @@ pub enum FillError {
     /// Not enough free space to reach the window — the device is already fuller
     /// than the target. Distinct from `Overfilled`: nothing was written.
     AlreadyBelowWindow { free: u64, low: u64 },
+    /// The requested filler folder name isn't usable.
+    BadName(NameError),
     Mtp(Error),
 }
 
@@ -76,6 +136,7 @@ impl std::fmt::Display for FillError {
                 "only {free} bytes free, already below the {low}-byte target; \
                  nothing to fill"
             ),
+            FillError::BadName(e) => write!(f, "{e}"),
             FillError::Mtp(e) => write!(f, "{e}"),
         }
     }
@@ -89,35 +150,137 @@ impl From<Error> for FillError {
     }
 }
 
+impl From<NameError> for FillError {
+    fn from(e: NameError) -> Self {
+        FillError::BadName(e)
+    }
+}
+
 /// Re-read free space from the device. Never trust the cached `info()`.
 async fn measure(storage: &mut Storage) -> Result<u64, Error> {
     storage.refresh().await?;
     Ok(storage.info().free_space)
 }
 
-/// Locate `fill_disk` at the storage root, if it exists.
-pub async fn find_fill_dir(storage: &Storage) -> Result<Option<ObjectInfo>, Error> {
+/// Locate the filler folder at the storage root, if it exists.
+///
+/// Root only, and an exact name match. Nothing in this module ever recurses looking
+/// for a folder to operate on — the one folder it will touch is the one named here.
+pub async fn find_fill_dir(
+    storage: &Storage,
+    dir_name: &str,
+) -> Result<Option<ObjectInfo>, Error> {
     let objects = storage.list_objects(Some(ObjectHandle::ROOT)).await?;
     Ok(objects
         .into_iter()
-        .find(|o| o.is_folder() && o.filename == FILL_DIR))
+        .find(|o| o.is_folder() && o.filename == dir_name))
 }
 
-async fn ensure_fill_dir(storage: &Storage) -> Result<ObjectHandle, Error> {
-    match find_fill_dir(storage).await? {
+async fn ensure_fill_dir(storage: &Storage, dir_name: &str) -> Result<ObjectHandle, Error> {
+    match find_fill_dir(storage, dir_name).await? {
         Some(existing) => Ok(existing.handle),
         None => {
             storage
-                .create_folder(Some(ObjectHandle::ROOT), FILL_DIR)
+                .create_folder(Some(ObjectHandle::ROOT), dir_name)
                 .await
         }
     }
 }
 
+/// Staged over-the-air firmware images at the storage root.
+///
+/// Root-only and read-only: this reports what's there. Deleting any of it needs
+/// [`delete_staged_updates`] and an explicit list of names from the user, because an
+/// update image is the one piece of device content this tool will remove that it
+/// didn't write.
+pub async fn list_staged_updates(storage: &Storage) -> Result<Vec<ObjectInfo>, Error> {
+    let mut found: Vec<ObjectInfo> = storage
+        .list_objects(Some(ObjectHandle::ROOT))
+        .await?
+        .into_iter()
+        .filter(|o| o.is_file() && is_staged_update(&o.filename))
+        .collect();
+    found.sort_by(|a, b| a.filename.cmp(&b.filename));
+    Ok(found)
+}
+
+/// Whether a root filename looks like a staged firmware image.
+///
+/// Matched case-insensitively on `update_….bin`. Deliberately a shape rather than a
+/// list of known model names: the names vary by device generation, and a new one
+/// showing up unrecognized would be the failure that matters. Breadth is safe here
+/// only because nothing is deleted without the user seeing the exact filenames first.
+fn is_staged_update(filename: &str) -> bool {
+    let lower = filename.to_ascii_lowercase();
+    lower.starts_with(UPDATE_PREFIX) && lower.ends_with(UPDATE_SUFFIX)
+}
+
+/// Delete named staged firmware images from the storage root.
+///
+/// Three independent gates, all of which must agree before anything is deleted: the
+/// object is at the **root**, its name matches the **staged-update shape**, and it is
+/// in the caller's **explicit list**. The list alone is not trusted — it arrives from
+/// the UI, and a name in it that isn't a root-level update image is ignored rather
+/// than deleted. That's what keeps "delete the update" from ever becoming "delete a
+/// book that was named convincingly".
+///
+/// Returns the objects actually removed.
+pub async fn delete_staged_updates<F>(
+    storage: &mut Storage,
+    names: &[String],
+    mut on_event: F,
+) -> Result<Vec<ObjectInfo>, Error>
+where
+    F: FnMut(Event),
+{
+    let doomed: Vec<ObjectInfo> = list_staged_updates(storage)
+        .await?
+        .into_iter()
+        .filter(|o| names.iter().any(|n| n == &o.filename))
+        .collect();
+
+    for update in &doomed {
+        storage.delete(update.handle).await?;
+        on_event(Event::Deleted {
+            name: update.filename.clone(),
+            bytes: update.size,
+        });
+    }
+
+    let free = measure(storage).await?;
+    on_event(Event::Finished { free });
+    Ok(doomed)
+}
+
+/// The single place that decides whether a filename is filler *this tool wrote*.
+///
+/// Everything destructive keys off this one answer: `clean`'s delete set and the
+/// resume sequence both come from here. They used to decide separately and
+/// disagreed — the delete set accepted any `fill_*.bin` while the sequence required
+/// digits, so a file a user dropped in `fill_disk` named `fill_notes.bin` was not a
+/// sequence number but *was* deletable. One reading, one answer.
+///
+/// The round-trip check is what makes it exact rather than merely strict: a name is
+/// ours only if formatting the number back reproduces it byte for byte. That rejects
+/// `fill_12.bin` and `fill_00000007.bin` — same integer, not a name we would ever
+/// write — without hard-coding a digit count that a long-running resume could
+/// eventually exceed.
+fn filler_sequence(filename: &str) -> Option<u32> {
+    let digits = filename
+        .strip_prefix(FILL_PREFIX)?
+        .strip_suffix(FILL_SUFFIX)?;
+    // `u32::from_str` accepts a leading `+`; we never write one.
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u32 = digits.parse().ok()?;
+    (format!("{n:04}") == digits).then_some(n)
+}
+
 /// Filler objects currently in `fill_disk`.
 ///
-/// Only files this tool would have written are matched. Anything else the user put
-/// in the folder is left strictly alone — `clean` must never delete a stray book.
+/// Only files this tool would have written are matched. Anything else in the folder
+/// is left strictly alone — `clean` must never delete a stray book.
 pub async fn list_fillers(
     storage: &Storage,
     dir: ObjectHandle,
@@ -126,27 +289,31 @@ pub async fn list_fillers(
         .list_objects(Some(dir))
         .await?
         .into_iter()
-        .filter(|o| {
-            o.is_file()
-                && o.filename.starts_with(FILL_PREFIX)
-                && o.filename.ends_with(FILL_SUFFIX)
-        })
+        .filter(|o| o.is_file() && filler_sequence(&o.filename).is_some())
         .collect();
     fillers.sort_by(|a, b| a.filename.cmp(&b.filename));
     Ok(fillers)
+}
+
+/// Everything in `fill_disk` that is *not* ours, so a caller can refuse to touch a
+/// folder someone else's content is living in.
+pub async fn list_foreign(
+    storage: &Storage,
+    dir: ObjectHandle,
+) -> Result<Vec<ObjectInfo>, Error> {
+    Ok(storage
+        .list_objects(Some(dir))
+        .await?
+        .into_iter()
+        .filter(|o| !(o.is_file() && filler_sequence(&o.filename).is_some()))
+        .collect())
 }
 
 /// Next unused sequence number, so an interrupted run tops up instead of colliding.
 fn next_sequence(existing: &[ObjectInfo]) -> u32 {
     existing
         .iter()
-        .filter_map(|o| {
-            o.filename
-                .strip_prefix(FILL_PREFIX)?
-                .strip_suffix(FILL_SUFFIX)?
-                .parse::<u32>()
-                .ok()
-        })
+        .filter_map(|o| filler_sequence(&o.filename))
         .max()
         .map_or(0, |n| n + 1)
 }
@@ -159,12 +326,13 @@ fn next_sequence(existing: &[ObjectInfo]) -> u32 {
 pub async fn fill<F>(
     storage: &mut Storage,
     window: Window,
+    dir_name: &str,
     on_event: F,
 ) -> Result<Outcome, FillError>
 where
     F: FnMut(Event) + Send,
 {
-    fill_with_cancel(storage, window, None, on_event).await
+    fill_with_cancel(storage, window, dir_name, None, on_event).await
 }
 
 /// Like [`fill`], but abortable.
@@ -179,12 +347,14 @@ where
 pub async fn fill_with_cancel<F>(
     storage: &mut Storage,
     window: Window,
+    dir_name: &str,
     cancel: Option<&CancelToken>,
     mut on_event: F,
 ) -> Result<Outcome, FillError>
 where
     F: FnMut(Event) + Send,
 {
+    validate_dir_name(dir_name)?;
     if !storage.info().is_writable {
         return Err(FillError::ReadOnly {
             description: storage.info().description.clone(),
@@ -208,7 +378,7 @@ where
         total,
     });
 
-    let dir = ensure_fill_dir(storage).await?;
+    let dir = ensure_fill_dir(storage, dir_name).await?;
     let mut seq = next_sequence(&list_fillers(storage, dir).await?);
     let mut rate = RateEstimator::new();
 
@@ -311,11 +481,15 @@ where
 ///
 /// The folder is only removed if nothing but filler was in it, so a book someone
 /// dropped in there survives — and so does the folder holding it.
-pub async fn clean<F>(storage: &mut Storage, mut on_event: F) -> Result<u64, Error>
+pub async fn clean<F>(
+    storage: &mut Storage,
+    dir_name: &str,
+    mut on_event: F,
+) -> Result<u64, Error>
 where
     F: FnMut(Event),
 {
-    let Some(dir) = find_fill_dir(storage).await? else {
+    let Some(dir) = find_fill_dir(storage, dir_name).await? else {
         let free = measure(storage).await?;
         on_event(Event::Finished { free });
         return Ok(free);
@@ -363,5 +537,33 @@ mod tests {
     fn sequence_ignores_names_this_tool_did_not_write() {
         let existing = vec![obj("mybook.azw3"), obj("fill_notanumber.bin"), obj("fill_.bin")];
         assert_eq!(next_sequence(&existing), 0);
+    }
+
+    /// The property that matters for `clean`: a name is ours only if we would write
+    /// exactly it. Everything rejected here is a file `clean` must leave alone, and
+    /// `list_fillers` — the delete set — is filtered by this same function, so this
+    /// is the guard against deleting someone's book.
+    #[test]
+    fn only_names_this_tool_would_write_are_recognized_as_filler() {
+        for ours in ["fill_0000.bin", "fill_0001.bin", "fill_9999.bin", "fill_10000.bin"] {
+            assert_eq!(
+                filler_sequence(ours).map(|n| format!("{FILL_PREFIX}{n:04}{FILL_SUFFIX}")),
+                Some(ours.to_string()),
+                "{ours} should round-trip as filler"
+            );
+        }
+        for theirs in [
+            "mybook.azw3",
+            "fill_notes.bin",   // the bug: prefix+suffix matched, so it was deletable
+            "fill_backup.bin",
+            "fill_.bin",
+            "fill_12.bin",      // right number, not a name we write
+            "fill_00000007.bin",
+            "fill_+001.bin",
+            "fill_0001.bin.bak",
+            "notfill_0001.bin",
+        ] {
+            assert_eq!(filler_sequence(theirs), None, "{theirs} must not be ours");
+        }
     }
 }

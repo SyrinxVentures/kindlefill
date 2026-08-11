@@ -28,9 +28,23 @@ measure-write-remeasure loop unable to converge, and it would have passed every 
 this repo before failing on the cable. It doesn't cache. The stray 4 KB block is exactly
 the kind of overhead the loop absorbs by measuring instead of tallying.
 
-**The GUI has not been run.** Its backend is type-checked and the workspace builds, but
-it was developed on Linux where a Tauri window can't be opened — treat first launch as
-unverified.
+The GUI has since been run against the same device, driven end to end:
+
+| Check | Result |
+|---|---|
+| Detects the device on launch | Yes — 25.46 GB capacity, 24.95 GB free, no filler |
+| Pre-flight estimate | 24.88 GB to write, ~17 min |
+| Progress during a 1 GiB object | 317 events, **largest gap 0.215 s** — the bar never freezes |
+| Stop, pressed mid-object | Responded in **under 0.9 s**, including deleting the partial object |
+| Fill again after Stop | Resumed — wrote `fill_0001.bin`, not `fill_0000.bin` |
+| Remove Filler | Free space returned to its starting value; `fill_disk` removed |
+
+Those runs used a window shifted ~2.5 GB below current free space rather than the
+50–90 MB default. Same code path — the ladder still lays down 1 GiB objects, so Stop is
+still tested mid-object — without parking the device at 70 MB free for the duration.
+
+The one path still unexercised is `ptpcamerad` taming, because the daemon has not been
+running on the machine this was tested on.
 
 ## Why this isn't just "copy some big files over"
 
@@ -72,12 +86,33 @@ cargo tauri build                    # build a .app / .dmg (needs `cargo install
 The frontend is a single static HTML file with no framework and no build step, so
 `cargo run` is enough — there's no dev server to start first.
 
+Two environment variables help when something goes wrong, both debug-only. A webview
+swallows JS errors — a frontend fault reaches neither stdout nor the window, it just
+leaves the UI inert — so `KINDLEFILL_DEVTOOLS=1` opens the inspector. And every figure
+the UI shows arrives as an engine event, so `KINDLEFILL_TRACE=1` mirrors that stream to
+stderr with timestamps, which is how the progress cadence and Stop latency above were
+measured rather than eyeballed.
+
 It shows the connected device, capacity, free space, and any filler already present;
 lets you set the target window; estimates the transfer up front; and runs the fill with
 a live bar, throughput, and ETA. **Stop** is wired to a real cancel token — checked
 inside the upload rather than only between objects, so it responds in about a second
 rather than up to 40. Stopping is safe: the half-written object is deleted, everything
 committed stays valid, and pressing Fill again resumes.
+
+Three things it tells you before you start, because each one costs you seventeen
+minutes if you find out afterwards:
+
+- **The folder by name.** Filler goes in `fill_disk` at the storage root, and the app
+  says so rather than reporting a file count — undoing this by hand means knowing what
+  to look for. The name is editable if that folder is taken.
+- **Anything in that folder that isn't ours.** `clean` never touches it, which means
+  the folder survives removal; that's worth knowing up front rather than discovering
+  afterwards. Items are listed by name and Fill is held until you confirm.
+- **A firmware update that's already downloaded.** Filling around one accomplishes
+  nothing — the bytes are on the device and it installs them at the next restart. The
+  app lists any `update_*.bin` at the root and offers to delete it, by name, on
+  confirmation.
 
 ## CLI
 
@@ -89,6 +124,10 @@ cargo run -p kindlefill-cli -- fill      # fill to 50-90 MB free
 cargo run -p kindlefill-cli -- fill --low 40MB --high 80MB
 cargo run -p kindlefill-cli -- clean     # remove all filler
 ```
+
+`status`, `fill` and `clean` take `--dir` to work in a folder other than `fill_disk`.
+`status` also reports anything in that folder this tool didn't write, and any staged
+firmware update at the root — the CLI reports those; only the app deletes them.
 
 `fill` renders a live progress bar with throughput and ETA:
 
@@ -106,6 +145,13 @@ on filenames.
 
 `clean` only deletes files matching its own `fill_NNNN.bin` naming, and only removes
 `fill_disk` if nothing else is in it — a book dropped in that folder survives.
+
+"Matching its own naming" is exact, not approximate: a name counts as filler only if
+formatting the number back reproduces it byte for byte, so `fill_notes.bin`,
+`fill_12.bin` and `fill_00000007.bin` are all left alone. One function answers that
+question and both the delete set and the resume sequence read it, because when the two
+were decided separately they disagreed — and the half that was too permissive was the
+half that deletes.
 
 ## Re-validating against hardware
 
@@ -127,13 +173,18 @@ number instead of a guess.
 ## Layout
 
 ```
-crates/kindlefill-core/    plan.rs    pure convergence logic, no I/O
-                          rate.rs    throughput smoothing, ETA, progress figures
-                          zeros.rs   synthetic byte source for uploads
-                          engine.rs  drives a real mtp_rs::Storage
+crates/kindlefill-core/    plan.rs        pure convergence logic, no I/O
+                          rate.rs        throughput smoothing, ETA, progress figures
+                          zeros.rs       synthetic byte source for uploads
+                          engine.rs      drives a real mtp_rs::Storage
+                          ptpcamerad.rs  keeps Apple's camera daemon off the device
 crates/kindlefill-cli/     probe / bench / status / fill / clean
 crates/kindlefill-app/     Tauri desktop UI (static HTML frontend, no build step)
 ```
+
+`ptpcamerad.rs` lives in core rather than in the CLI because both front ends need it.
+It started out private to the CLI, which meant the app could not tame the daemon at
+all — the README said the tool did, and for the GUI that was untrue.
 
 `plan.rs` is I/O-free so the hard part is testable without a Kindle. `engine.rs` is
 covered end-to-end in `tests/virtual_device.rs` against `mtp-rs`'s virtual device,
@@ -145,7 +196,7 @@ would pass every test here and hang on the cable. That's what `bench` is for, an
 Paperwhite Signature Edition it came back exact.
 
 ```bash
-cargo test      # 36 tests, no hardware required
+cargo test      # 37 tests, no hardware required
 ```
 
 ## License
@@ -167,7 +218,11 @@ this work shall be dual-licensed as above, with no additional terms or condition
 
 ## Scope
 
-Fill and unfill. It does not jailbreak anything, doesn't check whether your firmware is
-jailbreakable, and doesn't delete staged `update*.bin` files — filling around an
-already-downloaded update accomplishes nothing, so check for one yourself before
-starting, and turn on Airplane Mode.
+Fill and unfill. It does not jailbreak anything and doesn't check whether your firmware
+is jailbreakable. Turn on Airplane Mode.
+
+A staged `update_*.bin` is the one piece of device content this tool will delete that it
+didn't write, and only from the app, only after showing you the filename, and only on
+confirmation. Everything else on the Kindle is out of reach by construction: the engine
+deletes exactly two things, filler it can prove it wrote and updates you named, and the
+folder itself only when nothing but filler was in it.

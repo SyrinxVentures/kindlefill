@@ -17,6 +17,10 @@ use std::time::Duration;
 
 const CAPACITY: u64 = 64 * MIB;
 
+/// These tests exercise the default folder name; `validate_dir_name` and the
+/// alternate-name path are covered by unit tests in engine.rs.
+const DIR: &str = engine::DEFAULT_FILL_DIR;
+
 async fn open(backing: &Path) -> MtpDevice {
     MtpDevice::builder()
         .open_virtual(VirtualDeviceConfig {
@@ -64,7 +68,7 @@ async fn fill_lands_inside_the_window() {
     let mut storage = storage_of(&device).await;
     let w = window();
 
-    let outcome = engine::fill(&mut storage, w, |_| {}).await.expect("fill");
+    let outcome = engine::fill(&mut storage, w, DIR, |_| {}).await.expect("fill");
 
     match outcome {
         engine::Outcome::InWindow { free } => {
@@ -83,7 +87,7 @@ async fn fill_creates_the_fill_disk_folder_and_reports_progress() {
     let mut storage = storage_of(&device).await;
 
     let mut written = 0usize;
-    engine::fill(&mut storage, window(), |event| {
+    engine::fill(&mut storage, window(), DIR, |event| {
         if matches!(event, engine::Event::Wrote { .. }) {
             written += 1;
         }
@@ -92,16 +96,16 @@ async fn fill_creates_the_fill_disk_folder_and_reports_progress() {
     .expect("fill");
 
     assert!(written > 0, "should have written at least one object");
-    let dir = engine::find_fill_dir(&storage)
+    let dir = engine::find_fill_dir(&storage, DIR)
         .await
         .expect("lookup")
         .expect("fill_disk should exist");
-    assert_eq!(dir.filename, engine::FILL_DIR);
+    assert_eq!(dir.filename, DIR);
     assert_eq!(
         engine::list_fillers(&storage, dir.handle).await.unwrap().len(),
         written
     );
-    assert!(tmp.path().join(engine::FILL_DIR).is_dir(), "should exist on disk");
+    assert!(tmp.path().join(DIR).is_dir(), "should exist on disk");
 }
 
 #[tokio::test]
@@ -111,14 +115,14 @@ async fn clean_reclaims_everything_fill_consumed() {
     let mut storage = storage_of(&device).await;
 
     let before = free_space(&mut storage).await;
-    engine::fill(&mut storage, window(), |_| {}).await.expect("fill");
+    engine::fill(&mut storage, window(), DIR, |_| {}).await.expect("fill");
     assert!(free_space(&mut storage).await < before);
 
-    engine::clean(&mut storage, |_| {}).await.expect("clean");
+    engine::clean(&mut storage, DIR, |_| {}).await.expect("clean");
 
     assert_eq!(free_space(&mut storage).await, before, "should fully reclaim");
     assert!(
-        engine::find_fill_dir(&storage).await.unwrap().is_none(),
+        engine::find_fill_dir(&storage, DIR).await.unwrap().is_none(),
         "empty fill_disk should be removed too"
     );
 }
@@ -137,7 +141,7 @@ async fn progress_reporting_is_bounded_monotonic_and_complete() {
     let mut samples: Vec<kindlefill_core::FillProgress> = Vec::new();
     let mut objects = 0usize;
 
-    engine::fill(&mut storage, w, |event| match event {
+    engine::fill(&mut storage, w, DIR, |event| match event {
         engine::Event::Started { total, .. } => announced_total = Some(total),
         engine::Event::Progress(p) => samples.push(p),
         engine::Event::Wrote { .. } => objects += 1,
@@ -186,8 +190,8 @@ async fn fill_resumes_from_an_existing_partial_fill() {
     let mut storage = storage_of(&device).await;
     let w = window();
 
-    engine::fill(&mut storage, w, |_| {}).await.expect("first fill");
-    let dir = engine::find_fill_dir(&storage).await.unwrap().unwrap();
+    engine::fill(&mut storage, w, DIR, |_| {}).await.expect("first fill");
+    let dir = engine::find_fill_dir(&storage, DIR).await.unwrap().unwrap();
     let first_pass = engine::list_fillers(&storage, dir.handle).await.unwrap();
 
     // Simulate an interrupted run by removing the last object.
@@ -196,7 +200,7 @@ async fn fill_resumes_from_an_existing_partial_fill() {
     storage.delete(last.handle).await.expect("delete");
     assert!(!w.contains(free_space(&mut storage).await));
 
-    engine::fill(&mut storage, w, |_| {}).await.expect("second fill");
+    engine::fill(&mut storage, w, DIR, |_| {}).await.expect("second fill");
 
     assert!(w.contains(free_space(&mut storage).await));
     let after: Vec<_> = engine::list_fillers(&storage, dir.handle)
@@ -225,7 +229,7 @@ async fn a_precancelled_token_writes_nothing() {
     let cancel = mtp_rs::CancelToken::new();
     cancel.cancel();
 
-    let outcome = engine::fill_with_cancel(&mut storage, window(), Some(&cancel), |_| {})
+    let outcome = engine::fill_with_cancel(&mut storage, window(), DIR, Some(&cancel), |_| {})
         .await
         .expect("cancelling is not an error");
 
@@ -246,7 +250,7 @@ async fn cancelling_mid_fill_leaves_a_resumable_state() {
     let cancel = mtp_rs::CancelToken::new();
     let mut written = 0;
 
-    let outcome = engine::fill_with_cancel(&mut storage, w, Some(&cancel), |event| {
+    let outcome = engine::fill_with_cancel(&mut storage, w, DIR, Some(&cancel), |event| {
         if matches!(event, engine::Event::Wrote { .. }) {
             written += 1;
             if written == 1 {
@@ -263,12 +267,12 @@ async fn cancelling_mid_fill_leaves_a_resumable_state() {
     assert!(!w.contains(mid), "should have stopped short of the target");
 
     // The decisive property: a plain re-run finishes the job.
-    let outcome = engine::fill(&mut storage, w, |_| {}).await.expect("resume");
+    let outcome = engine::fill(&mut storage, w, DIR, |_| {}).await.expect("resume");
     assert!(matches!(outcome, engine::Outcome::InWindow { .. }));
     assert!(w.contains(free_space(&mut storage).await));
 
     // And no filler was orphaned or duplicated along the way.
-    let dir = engine::find_fill_dir(&storage).await.unwrap().unwrap();
+    let dir = engine::find_fill_dir(&storage, DIR).await.unwrap().unwrap();
     let names: Vec<_> = engine::list_fillers(&storage, dir.handle)
         .await
         .unwrap()
@@ -288,28 +292,47 @@ async fn clean_leaves_foreign_files_and_their_folder_alone() {
     let device = open(tmp.path()).await;
     let mut storage = storage_of(&device).await;
 
-    engine::fill(&mut storage, window(), |_| {}).await.expect("fill");
-    let dir = engine::find_fill_dir(&storage).await.unwrap().unwrap();
+    engine::fill(&mut storage, window(), DIR, |_| {}).await.expect("fill");
+    let dir = engine::find_fill_dir(&storage, DIR).await.unwrap().unwrap();
 
-    // A book someone dropped into fill_disk.
-    storage
-        .upload(
-            Some(dir.handle),
-            NewObjectInfo::file("mybook.azw3", 1024),
-            kindlefill_core::ZeroStream::new(1024),
-        )
-        .await
-        .expect("upload book");
+    // Things someone dropped into fill_disk. The last three are the ones that matter:
+    // they sit inside our own naming space and differ only in the part `clean` has to
+    // read correctly. An earlier filter tested prefix and suffix alone and would have
+    // deleted all three.
+    let foreign = [
+        "mybook.azw3",
+        "fill_notes.bin",
+        "fill_12.bin",
+        "fill_00000007.bin",
+    ];
+    for name in foreign {
+        storage
+            .upload(
+                Some(dir.handle),
+                NewObjectInfo::file(name, 1024),
+                kindlefill_core::ZeroStream::new(1024),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("upload {name}"));
+    }
 
-    engine::clean(&mut storage, |_| {}).await.expect("clean");
+    engine::clean(&mut storage, DIR, |_| {}).await.expect("clean");
 
-    let dir = engine::find_fill_dir(&storage)
+    let dir = engine::find_fill_dir(&storage, DIR)
         .await
         .unwrap()
-        .expect("folder must survive because it still holds a file");
-    let remaining = storage.list_objects(Some(dir.handle)).await.unwrap();
-    assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0].filename, "mybook.azw3");
+        .expect("folder must survive because it still holds files");
+    let mut remaining: Vec<_> = storage
+        .list_objects(Some(dir.handle))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|o| o.filename)
+        .collect();
+    remaining.sort();
+    let mut expected: Vec<String> = foreign.iter().map(|s| s.to_string()).collect();
+    expected.sort();
+    assert_eq!(remaining, expected, "clean deleted something that wasn't ours");
 }
 
 #[tokio::test]
@@ -329,12 +352,12 @@ async fn refuses_to_fill_a_device_already_below_the_window() {
         .await
         .expect("upload bulk");
 
-    match engine::fill(&mut storage, window(), |_| {}).await {
+    match engine::fill(&mut storage, window(), DIR, |_| {}).await {
         Err(engine::FillError::AlreadyBelowWindow { .. }) => {}
         other => panic!("expected AlreadyBelowWindow, got {other:?}"),
     }
     assert!(
-        engine::find_fill_dir(&storage).await.unwrap().is_none(),
+        engine::find_fill_dir(&storage, DIR).await.unwrap().is_none(),
         "must not leave an empty fill_disk behind after refusing"
     );
 }

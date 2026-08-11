@@ -5,11 +5,11 @@
 //! enumerate, does reported free space actually move after a write, how fast is the
 //! wire, and does taming `ptpcamerad` need root.
 
-mod ptpcamerad;
-
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use kindlefill_core::{engine, human_bytes, is_exclusive_access, Event, Window, MIB};
+use kindlefill_core::{
+    engine, human_bytes, is_exclusive_access, ptpcamerad, Event, Window, MIB,
+};
 use mtp_rs::{CancelToken, MtpDevice, NewObjectInfo, ObjectHandle, Storage};
 use std::io::{self, IsTerminal};
 use std::time::Instant;
@@ -27,17 +27,26 @@ enum Command {
     Probe,
     /// Measure write throughput and verify free space tracks writes. Cleans up after itself.
     Bench,
-    /// Show current free space and any existing filler.
-    Status,
+    /// Show current free space, any existing filler, and any staged firmware update.
+    Status {
+        #[arg(long, default_value = engine::DEFAULT_FILL_DIR)]
+        dir: String,
+    },
     /// Fill until free space lands inside the window.
     Fill {
         #[arg(long, default_value = "50MB", value_parser = parse_size)]
         low: u64,
         #[arg(long, default_value = "90MB", value_parser = parse_size)]
         high: u64,
+        /// Folder to put filler in, at the storage root.
+        #[arg(long, default_value = engine::DEFAULT_FILL_DIR)]
+        dir: String,
     },
     /// Delete all filler this tool wrote.
-    Clean,
+    Clean {
+        #[arg(long, default_value = engine::DEFAULT_FILL_DIR)]
+        dir: String,
+    },
 }
 
 /// Accepts `50MB`, `90 MiB`, `2GB`, or a raw byte count.
@@ -63,9 +72,9 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Probe => probe().await,
         Command::Bench => bench().await,
-        Command::Status => status().await,
-        Command::Fill { low, high } => fill(low, high).await,
-        Command::Clean => clean().await,
+        Command::Status { dir } => status(&dir).await,
+        Command::Fill { low, high, dir } => fill(low, high, &dir).await,
+        Command::Clean { dir } => clean(&dir).await,
     }
 }
 
@@ -209,7 +218,7 @@ async fn bench() -> Result<()> {
     Ok(())
 }
 
-async fn status() -> Result<()> {
+async fn status(dir_name: &str) -> Result<()> {
     let device = open().await?;
     let mut storage = writable_storage(&device).await?;
     storage.refresh().await?;
@@ -221,18 +230,39 @@ async fn status() -> Result<()> {
         human_bytes(s.total_capacity)
     );
 
-    match engine::find_fill_dir(&storage).await? {
-        None => println!("no {} folder", engine::FILL_DIR),
+    match engine::find_fill_dir(&storage, dir_name).await? {
+        None => println!("no {dir_name} folder"),
         Some(dir) => {
             let fillers = engine::list_fillers(&storage, dir.handle).await?;
             let total: u64 = fillers.iter().map(|f| f.size).sum();
             println!(
-                "{}: {} filler object(s), {}",
-                engine::FILL_DIR,
+                "{dir_name}: {} filler object(s), {}",
                 fillers.len(),
                 human_bytes(total)
             );
+            // Anything else in there is the user's, and `clean` will leave it — say so
+            // here rather than letting them discover the folder survived and wonder why.
+            let foreign = engine::list_foreign(&storage, dir.handle).await?;
+            for other in &foreign {
+                println!("  (not ours, will be left alone: {})", other.filename);
+            }
         }
+    }
+
+    // Filling around an already-downloaded update accomplishes nothing, so this is
+    // worth knowing before a 17-minute transfer rather than after one.
+    let updates = engine::list_staged_updates(&storage).await?;
+    if updates.is_empty() {
+        println!("no staged firmware update");
+    } else {
+        for u in &updates {
+            println!(
+                "staged firmware update: {} ({})",
+                u.filename,
+                human_bytes(u.size)
+            );
+        }
+        println!("  filling around a staged update accomplishes nothing — remove it first");
     }
     Ok(())
 }
@@ -270,7 +300,7 @@ fn render_progress(p: &kindlefill_core::FillProgress, tty: bool) {
     let _ = io::Write::flush(&mut io::stderr());
 }
 
-async fn fill(low: u64, high: u64) -> Result<()> {
+async fn fill(low: u64, high: u64, dir_name: &str) -> Result<()> {
     let window = Window::new(low, high).map_err(|e| anyhow::anyhow!("{e}"))?;
     let device = open().await?;
     let mut storage = writable_storage(&device).await?;
@@ -292,8 +322,12 @@ async fn fill(low: u64, high: u64) -> Result<()> {
 
     let started = Instant::now();
     let mut drew_bar = false;
-    let outcome = engine::fill_with_cancel(&mut storage, window, Some(&cancel), |event| match event
-    {
+    let outcome = engine::fill_with_cancel(
+        &mut storage,
+        window,
+        dir_name,
+        Some(&cancel),
+        |event| match event {
         Event::Started { free, aim, total } => println!(
             "starting at {} free, steering to {} — {} to write",
             human_bytes(free),
@@ -323,8 +357,9 @@ async fn fill(low: u64, high: u64) -> Result<()> {
             }
             println!("finished at {} free", human_bytes(free));
         }
-        Event::Deleted { .. } => {}
-    })
+            Event::Deleted { .. } => {}
+        },
+    )
     .await?;
 
     match outcome {
@@ -349,11 +384,11 @@ async fn fill(low: u64, high: u64) -> Result<()> {
     Ok(())
 }
 
-async fn clean() -> Result<()> {
+async fn clean(dir_name: &str) -> Result<()> {
     let device = open().await?;
     let mut storage = writable_storage(&device).await?;
     let mut removed = 0u64;
-    let free = engine::clean(&mut storage, |event| match event {
+    let free = engine::clean(&mut storage, dir_name, |event| match event {
         Event::Deleted { name, bytes } => {
             removed += bytes;
             println!("  deleted {name} ({})", human_bytes(bytes));

@@ -7,13 +7,14 @@
     "frontendDist": "ui"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "title": "KindleFill",
         "width": 620,
-        "height": 720,
+        "height": 760,
         "minWidth": 520,
-        "minHeight": 600,
+        "minHeight": 640,
         "resizable": true
       }
     ],

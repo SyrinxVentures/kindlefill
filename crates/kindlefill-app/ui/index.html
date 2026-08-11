@@ -15,15 +15,30 @@
     }
   }
   * { box-sizing: border-box; }
+  /* The window never scrolls. Everything above the log is fixed-height, so the log
+     takes the remainder — which keeps the layout exact at the default size and
+     still correct when the window is resized or a warning appears and pushes
+     everything down. A fixed log height can only be right at one window size, and it
+     wasn't right at this one.
+
+     `overflow-y: auto` rather than `hidden`: normally the log soaks up the slack and
+     no scrollbar appears at all, but when the conflict and firmware banners are both
+     showing there is genuinely more content than fits, and scrolling to it beats
+     silently clipping it. */
+  html, body { height: 100%; }
   body {
     margin: 0; padding: 20px; background: var(--bg); color: var(--ink);
     font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; overflow-y: auto;
   }
-  h1 { font-size: 17px; margin: 0 0 14px; }
+  h1 { font-size: 17px; margin: 0 0 14px; flex: none; }
   .card {
     background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
-    padding: 14px; margin-bottom: 14px;
+    padding: 14px; margin-bottom: 14px; flex: none;
   }
+  /* `min-height: 0` is load-bearing: without it a flex item refuses to shrink below
+     its content, and the log's own scroll area would push the page tall again. */
+  .card.grow { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; margin-bottom: 0; }
   .row { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; }
   .row .k { color: var(--muted); }
   .row .v { font-variant-numeric: tabular-nums; }
@@ -33,9 +48,15 @@
   label { color: var(--muted); display: block; margin-bottom: 4px; }
   .targets { display: flex; gap: 10px; align-items: flex-end; }
   .targets > div { flex: 1; }
-  input[type=number] {
+  input[type=number], input[type=text] {
     width: 100%; padding: 7px 8px; border: 1px solid var(--line); border-radius: 7px;
     background: var(--bg); color: var(--ink); font: inherit; font-variant-numeric: tabular-nums;
+  }
+  .ack { display: flex; align-items: center; gap: 6px; margin-top: 6px; color: inherit; }
+  .ack input { margin: 0; }
+  .names {
+    margin: 4px 0 0; padding-left: 18px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
   }
   .buttons { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
   button {
@@ -52,12 +73,14 @@
   .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
   .meta { display: flex; justify-content: space-between; color: var(--muted); font-variant-numeric: tabular-nums; }
   #log {
-    height: 150px; overflow-y: auto; background: var(--bg); border: 1px solid var(--line);
+    flex: 1 1 auto; min-height: 60px;
+    overflow-y: auto; background: var(--bg); border: 1px solid var(--line);
     border-radius: 7px; padding: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 12px; white-space: pre-wrap; word-break: break-word;
   }
   .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
   .note.warn { color: var(--warn); }
+  .note.bad { color: var(--bad); }
   .hidden { display: none; }
 </style>
 </head>
@@ -70,9 +93,27 @@
       <div class="row"><span class="k">Storage</span><span class="v" id="d-storage">—</span></div>
       <div class="row"><span class="k">Capacity</span><span class="v" id="d-total">—</span></div>
       <div class="row"><span class="k">Free now</span><span class="v" id="d-free">—</span></div>
+      <div class="row"><span class="k">Filler folder</span><span class="v" id="d-dir">—</span></div>
       <div class="row"><span class="k">Existing filler</span><span class="v" id="d-filler">—</span></div>
+      <div id="dirbox" class="hidden" style="margin-top:8px">
+        <label for="dirname">Folder name, at the storage root</label>
+        <input type="text" id="dirname" value="fill_disk" spellcheck="false" autocapitalize="off" />
+      </div>
+      <div class="note warn hidden" id="foreignwarn">
+        <div id="foreigntext"></div>
+        <ul class="names" id="foreignlist"></ul>
+        <label class="ack"><input type="checkbox" id="foreignack" /> Use this folder anyway</label>
+      </div>
+      <div class="note bad hidden" id="updatewarn">
+        <div id="updatetext"></div>
+        <ul class="names" id="updatelist"></ul>
+      </div>
     </div>
-    <div class="buttons"><button id="refresh">Refresh</button></div>
+    <div class="buttons">
+      <button id="refresh">Refresh</button>
+      <button id="rename">Change folder…</button>
+      <button id="delupdates" class="hidden">Delete staged update</button>
+    </div>
   </div>
 
   <div class="card">
@@ -89,7 +130,7 @@
     </div>
   </div>
 
-  <div class="card">
+  <div class="card grow">
     <div class="bar"><i id="barfill"></i></div>
     <div class="meta"><span id="p-left">Idle</span><span id="p-right"></span></div>
     <div id="log" style="margin-top:10px"></div>
@@ -116,6 +157,18 @@ function log(line) {
 
 function readWindow() {
   return { low: Math.round(Number($('low').value) * MB), high: Math.round(Number($('high').value) * MB) };
+}
+
+const DEFAULT_DIR = 'fill_disk';
+function dirName() {
+  return $('dirname').value.trim() || DEFAULT_DIR;
+}
+
+/// True when the folder holds something this tool didn't write and the user hasn't
+/// said to use it anyway. `clean` never touches those files — but a folder full of
+/// someone else's content is a sign we're about to move into the wrong room.
+function blockedByForeign() {
+  return !!(device && device.foreign.length && !$('foreignack').checked);
 }
 
 /// Mirrors Window::MIN_WIDTH in plan.rs. Checked here purely so the problem is visible
@@ -149,11 +202,24 @@ function estimate() {
 
 function setBusy(on) {
   busy = on;
-  $('fill').disabled = on || !device;
+  $('fill').disabled = on || !device || blockedByForeign();
   $('clean').disabled = on || !device;
   $('refresh').disabled = on;
   $('stop').disabled = !on;
   $('low').disabled = on; $('high').disabled = on;
+  // The folder name selects what the running operation is writing into; changing it
+  // mid-fill would leave the UI describing a folder the engine isn't using.
+  $('dirname').disabled = on; $('rename').disabled = on;
+  $('delupdates').disabled = on;
+}
+
+function fillList(el, items) {
+  el.textContent = '';
+  for (const it of items) {
+    const li = document.createElement('li');
+    li.textContent = `${it.name} (${it.human})`;
+    el.appendChild(li);
+  }
 }
 
 function renderDevice(d) {
@@ -164,23 +230,56 @@ function renderDevice(d) {
   $('d-storage').textContent = d.storage;
   $('d-total').textContent = d.total_human;
   $('d-free').textContent = d.free_human;
+  // Named, not just counted: undoing this by hand means knowing what to look for.
+  $('d-dir').textContent = d.fill_dir + (d.fill_dir_exists ? '' : ' (not present yet)');
   $('d-filler').textContent = d.filler_files
     ? `${d.filler_files} file${d.filler_files === 1 ? '' : 's'}, ${d.filler_human}`
     : 'none';
-  $('fill').disabled = !d.writable;
+
+  const foreign = d.foreign.length > 0;
+  $('foreignwarn').classList.toggle('hidden', !foreign);
+  if (foreign) {
+    $('foreigntext').textContent =
+      `${d.fill_dir} holds ${d.foreign.length} item${d.foreign.length === 1 ? '' : 's'} ` +
+      `this tool didn't write. ${d.foreign.length === 1 ? 'It' : 'They'} and the folder will be ` +
+      `left in place. Use a different name, or confirm:`;
+    fillList($('foreignlist'), d.foreign);
+    // A fresh listing is a fresh decision; don't carry an old acknowledgement over.
+    $('foreignack').checked = false;
+  }
+
+  // Filling around an update that's already downloaded accomplishes nothing — the
+  // bytes are on the device and it will install them at the next restart.
+  const staged = d.updates.length > 0;
+  $('updatewarn').classList.toggle('hidden', !staged);
+  $('delupdates').classList.toggle('hidden', !staged);
+  if (staged) {
+    $('updatetext').textContent =
+      `A firmware update is already downloaded. Filling around it accomplishes nothing — ` +
+      `the Kindle will install it at the next restart. Delete it first:`;
+    fillList($('updatelist'), d.updates);
+  }
+
+  $('fill').disabled = !d.writable || blockedByForeign();
   $('clean').disabled = d.filler_files === 0;
   estimate();
 }
 
 async function refresh() {
+  // Fill and Remove Filler open the device themselves. Leaving them live while a
+  // detect is in flight lets a fast click land during it, and the second open fails
+  // for exclusive access — a confusing error for what looks like an idle app.
   $('refresh').disabled = true;
+  $('fill').disabled = true;
+  $('clean').disabled = true;
   try {
-    renderDevice(await invoke('detect'));
+    renderDevice(await invoke('detect', { dirName: dirName() }));
   } catch (e) {
     device = null;
     $('dot').className = 'dot bad';
     $('devline').textContent = 'No Kindle found';
     $('devinfo').classList.add('hidden');
+    $('delupdates').classList.add('hidden');
     $('fill').disabled = true; $('clean').disabled = true;
     log(String(e));
   } finally {
@@ -200,13 +299,46 @@ listen('kindlefill://progress', (e) => {
 $('refresh').onclick = refresh;
 for (const id of ['low', 'high']) $(id).oninput = estimate;
 
+$('rename').onclick = () => {
+  const box = $('dirbox');
+  box.classList.toggle('hidden');
+  if (!box.classList.contains('hidden')) $('dirname').focus();
+};
+
+// Changing the name changes which folder we're looking at, so the whole picture —
+// existing filler, foreign content — has to be re-read before Fill means anything.
+let dirDebounce;
+$('dirname').oninput = () => {
+  clearTimeout(dirDebounce);
+  dirDebounce = setTimeout(() => { if (!busy) refresh(); }, 400);
+};
+
+$('foreignack').onchange = () => {
+  $('fill').disabled = !device || !device.writable || blockedByForeign();
+};
+
+$('delupdates').onclick = async () => {
+  const names = device ? device.updates.map((u) => u.name) : [];
+  if (!names.length) return;
+  if (!confirm(`Permanently delete from the Kindle:\n\n${names.join('\n')}\n\nThis cannot be undone.`)) return;
+  setBusy(true);
+  try {
+    log(await invoke('delete_updates', { names }));
+  } catch (e) {
+    log('Error: ' + String(e));
+  } finally {
+    setBusy(false);
+    await refresh();
+  }
+};
+
 $('fill').onclick = async () => {
-  if (!validate()) return;
+  if (!validate() || blockedByForeign()) return;
   const { low, high } = readWindow();
   setBusy(true);
   $('barfill').style.width = '0%';
   try {
-    log(await invoke('start_fill', { low, high }));
+    log(await invoke('start_fill', { low, high, dirName: dirName() }));
   } catch (e) {
     log('Error: ' + String(e));
   } finally {
@@ -224,7 +356,7 @@ $('stop').onclick = async () => {
 $('clean').onclick = async () => {
   setBusy(true);
   try {
-    log(await invoke('start_clean'));
+    log(await invoke('start_clean', { dirName: dirName() }));
   } catch (e) {
     log('Error: ' + String(e));
   } finally {

@@ -371,7 +371,8 @@ async fn start_fill(
             human_bytes(free)
         )),
         engine::Outcome::Overfilled { free, excess } => Ok(format!(
-            "Overfilled: {} free, {} below target. Use Remove Filler to recover.",
+            "Overfilled: {} free, {} below target. Use Remove Fill Folder & Fill \
+             Content to recover.",
             human_bytes(free),
             human_bytes(excess)
         )),

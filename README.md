@@ -127,10 +127,12 @@ On a transfer whose true throughput was 25.5 MB/s, the old exponential average r
 22-86 MB/s and centred near 35 — the displayed speed was wrong, and the ETA it fed was
 optimistic. The window reported 23.6-27.3, centred on 25.6. The ETA uses a longer
 thirty-second horizon and is rounded coarser the further out it is, so the text
-changes about once every four seconds instead of ten times a second. **Stop** is wired to a real cancel token — checked
-inside the upload rather than only between objects, so it responds in about a second
-rather than up to 40. Stopping is safe: the half-written object is deleted, everything
-committed stays valid, and pressing Fill again resumes.
+changes about once every four seconds instead of ten times a second.
+
+**Stop** is wired to a real cancel token — checked inside the upload rather than only
+between objects, so it responds in about a second rather than up to 40. Stopping is
+safe: the half-written object is deleted, everything committed stays valid, and
+pressing Fill again resumes.
 
 Three things it tells you before you start, because each one costs you seventeen
 minutes if you find out afterwards:

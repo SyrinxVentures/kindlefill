@@ -191,6 +191,11 @@
         <div class="buttons"><button id="delupdates">Delete staged update</button></div>
       </div>
 
+      <div class="callout hidden" id="elsewhere">
+        <div class="note" id="elsewheretext"></div>
+        <div class="buttons"><button id="useelsewhere">Use that folder</button></div>
+      </div>
+
       <div class="callout callout--warn hidden" id="foreignwarn">
         <div class="note" id="foreigntext"></div>
         <ul class="names" id="foreignlist"></ul>
@@ -374,6 +379,18 @@ function renderDevice(d) {
   $('d-total').textContent = d.total_human;
   paintLiveRows(d);
 
+  // Filler under another name. The app forgets the folder between launches, so
+  // without this a relaunch reports an empty default while gigabytes sit elsewhere —
+  // and Remove, aimed at the default, would delete nothing and say it worked.
+  const stray = d.elsewhere && d.elsewhere.length ? d.elsewhere[0] : null;
+  $('elsewhere').classList.toggle('hidden', !stray);
+  if (stray) {
+    $('elsewhere').dataset.name = stray.name;
+    $('elsewheretext').textContent =
+      `${d.fill_dir} is empty, but ${stray.files} filler file${stray.files === 1 ? '' : 's'} ` +
+      `(${stray.human}) are in ${stray.name}. Remove only works on the folder shown above.`;
+  }
+
   const foreign = d.foreign.length > 0;
   $('foreignwarn').classList.toggle('hidden', !foreign);
   if (foreign) {
@@ -421,6 +438,7 @@ function showNoDevice(line) {
   $('devline').textContent = line;
   $('devinfo').classList.add('hidden');
   $('updatewarn').classList.add('hidden');
+  $('elsewhere').classList.add('hidden');
   $('fill').disabled = true;
   $('clean').disabled = true;
 }
@@ -494,6 +512,13 @@ async function applyDirName() {
   appliedDir = name;
   await refresh();
 }
+
+$('useelsewhere').onclick = async () => {
+  const name = $('elsewhere').dataset.name;
+  if (!name) return;
+  $('dirname').value = name;
+  await applyDirName();
+};
 
 $('rename').onclick = async () => {
   const opening = $('dirbox').classList.contains('hidden');

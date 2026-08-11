@@ -74,6 +74,18 @@ struct DeviceSnapshot {
     foreign: Vec<NamedObject>,
     /// Staged OTA firmware images at the storage root.
     updates: Vec<NamedObject>,
+    /// Filler found under a *different* folder name. Nothing persists the name
+    /// between launches, so this is how a relaunch finds filler it wrote yesterday
+    /// instead of reporting an empty default and offering to delete nothing.
+    elsewhere: Vec<FillerFolderInfo>,
+}
+
+#[derive(Serialize, Clone)]
+struct FillerFolderInfo {
+    name: String,
+    files: usize,
+    bytes: u64,
+    human: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -322,6 +334,26 @@ async fn detect(dir_name: String) -> Result<DeviceSnapshot, String> {
             .collect();
     }
 
+    // Only go looking when it isn't where we expected: scanning every root folder
+    // costs a listing each, and on a device with a large documents folder that is not
+    // free. When the configured folder has filler, there is nothing to look for.
+    let mut elsewhere = Vec::new();
+    if filler_files == 0 {
+        for f in engine::find_filler_folders(storage)
+            .await
+            .map_err(|e| explain(&e))?
+        {
+            if f.name != dir_name {
+                elsewhere.push(FillerFolderInfo {
+                    name: f.name,
+                    files: f.files,
+                    bytes: f.bytes,
+                    human: human_bytes(f.bytes),
+                });
+            }
+        }
+    }
+
     let updates = engine::list_staged_updates(storage)
         .await
         .map_err(|e| explain(&e))?
@@ -345,6 +377,7 @@ async fn detect(dir_name: String) -> Result<DeviceSnapshot, String> {
         filler_human: human_bytes(filler_bytes),
         foreign,
         updates,
+        elsewhere,
     })
 }
 
@@ -453,12 +486,34 @@ async fn start_clean(
     let mut session = open_device().await?;
     let storage = &mut session.storage;
     let handle = app.clone();
-    let free = engine::clean(storage, &dir_name, move |ev| forward(&handle, ev))
+    let report = engine::clean(storage, &dir_name, move |ev| forward(&handle, ev))
         .await
         .map_err(|e| explain_fill(&e))?;
 
     *state.cancel.lock().unwrap() = None;
-    Ok(format!("Filler removed — {} free.", human_bytes(free)))
+    if report.removed > 0 {
+        return Ok(format!(
+            "Removed {} filler file{} ({}) from {dir_name} — {} free.",
+            report.removed,
+            if report.removed == 1 { "" } else { "s" },
+            human_bytes(report.bytes),
+            human_bytes(report.free)
+        ));
+    }
+    // Deleting nothing and reporting success is how someone concludes their device is
+    // clean while gigabytes of filler sit in a folder under another name. Say where.
+    let others = engine::find_filler_folders(storage)
+        .await
+        .map_err(|e| explain(&e))?;
+    match others.iter().find(|f| f.name != dir_name) {
+        Some(f) => Ok(format!(
+            "Nothing to remove in {dir_name}, but {} of filler is in {} — switch to \
+             that folder and try again.",
+            human_bytes(f.bytes),
+            f.name
+        )),
+        None => Ok(format!("No filler to remove — {} free.", human_bytes(report.free))),
+    }
 }
 
 /// Is a device on the bus at all?

@@ -554,3 +554,65 @@ async fn overwriting_a_folder_that_does_not_exist_is_a_no_op() {
     );
     assert_eq!(root_names(&storage).await, vec!["root_book.azw3"]);
 }
+
+/// The bug a real device found: nothing persists the folder name, so a relaunch looks
+/// at the default and reports nothing while the filler sits under the name the user
+/// chose. Discovery has to find it wherever it is — and must not mistake a folder of
+/// books for one of ours.
+#[tokio::test]
+async fn filler_is_found_whatever_the_folder_is_called() {
+    let tmp = tempfile::tempdir().unwrap();
+    let device = open(tmp.path()).await;
+    let mut storage = storage_of(&device).await;
+
+    // Filler under a name that isn't the default.
+    engine::fill(&mut storage, window(), "fill_disk2112", |_| {})
+        .await
+        .expect("fill");
+
+    // A decoy: a root folder full of things that are not ours.
+    let books = storage
+        .create_folder(Some(ObjectHandle::ROOT), "documents")
+        .await
+        .expect("create documents");
+    put(&storage, books, "mybook.azw3", 4096).await;
+    put(&storage, books, "fill_notes.bin", 4096).await;
+
+    let found = engine::find_filler_folders(&storage).await.expect("scan");
+    assert_eq!(found.len(), 1, "should find exactly the filler folder: {found:?}");
+    assert_eq!(found[0].name, "fill_disk2112");
+    assert!(found[0].files > 0 && found[0].bytes > 0);
+
+    // And the default name genuinely holds nothing, which is what made this invisible.
+    assert!(engine::find_fill_dir(&storage, DIR).await.unwrap().is_none());
+}
+
+/// `clean` aimed at the wrong folder must not claim success. Reporting only free
+/// space cannot distinguish "removed everything" from "there was nothing here".
+#[tokio::test]
+async fn cleaning_the_wrong_folder_reports_that_it_removed_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let device = open(tmp.path()).await;
+    let mut storage = storage_of(&device).await;
+
+    engine::fill(&mut storage, window(), "somewhere_else", |_| {})
+        .await
+        .expect("fill");
+    let before = free_space(&mut storage).await;
+
+    let report = engine::clean(&mut storage, DIR, |_| {}).await.expect("clean");
+    assert_eq!(report.removed, 0, "nothing in {DIR} to remove");
+    assert_eq!(report.bytes, 0);
+    assert_eq!(free_space(&mut storage).await, before, "must not have freed anything");
+
+    // The filler is still where it was, and still findable.
+    let found = engine::find_filler_folders(&storage).await.unwrap();
+    assert_eq!(found[0].name, "somewhere_else");
+
+    // Aimed correctly, it reports what it did.
+    let report = engine::clean(&mut storage, "somewhere_else", |_| {})
+        .await
+        .expect("clean");
+    assert!(report.removed > 0 && report.bytes > 0, "{report:?}");
+    assert!(free_space(&mut storage).await > before);
+}

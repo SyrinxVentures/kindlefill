@@ -295,6 +295,59 @@ pub async fn list_fillers(
     Ok(fillers)
 }
 
+/// A root-level folder holding filler this tool wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FillerFolder {
+    pub name: String,
+    pub files: usize,
+    pub bytes: u64,
+}
+
+/// Find filler wherever it actually is, not only where we expected it.
+///
+/// Nothing remembers the folder name between launches, so it resets to the default
+/// while the filler may be under any name the user chose. Looking only at the
+/// configured name meant a relaunch reported "not present yet" over 24.88 GB of
+/// filler sitting in a renamed folder — and worse, `clean` aimed at the default
+/// deleted nothing and said it had succeeded.
+///
+/// Root-level only, and a folder counts only if it holds something [`list_fillers`]
+/// recognises, so this can't mistake a books folder for ours.
+pub async fn find_filler_folders(storage: &Storage) -> Result<Vec<FillerFolder>, Error> {
+    let mut found = Vec::new();
+    for object in storage.list_objects(Some(ObjectHandle::ROOT)).await? {
+        if !object.is_folder() {
+            continue;
+        }
+        let fillers = list_fillers(storage, object.handle).await?;
+        if fillers.is_empty() {
+            continue;
+        }
+        found.push(FillerFolder {
+            name: object.filename,
+            files: fillers.len(),
+            bytes: fillers.iter().map(|f| f.size).sum(),
+        });
+    }
+    // Biggest first: if there are several, the one holding the most is the one whose
+    // space someone is trying to get back.
+    found.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
+    Ok(found)
+}
+
+/// What a [`clean`] actually did.
+///
+/// `removed` exists so a caller can tell "there was nothing to remove" from "removed
+/// everything", which reporting only free space cannot. Saying "Filler removed" after
+/// deleting nothing is how someone concludes their device is clean while 24.88 GB of
+/// filler sits in a folder under a different name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanReport {
+    pub free: u64,
+    pub removed: usize,
+    pub bytes: u64,
+}
+
 /// Everything in `fill_disk` that is *not* ours, so a caller can refuse to touch a
 /// folder someone else's content is living in.
 pub async fn list_foreign(
@@ -546,7 +599,7 @@ pub async fn clean<F>(
     storage: &mut Storage,
     dir_name: &str,
     mut on_event: F,
-) -> Result<u64, FillError>
+) -> Result<CleanReport, FillError>
 where
     F: FnMut(Event),
 {
@@ -557,11 +610,14 @@ where
     let Some(dir) = find_fill_dir(storage, dir_name).await? else {
         let free = measure(storage).await?;
         on_event(Event::Finished { free });
-        return Ok(free);
+        return Ok(CleanReport { free, removed: 0, bytes: 0 });
     };
 
+    let (mut removed, mut bytes) = (0usize, 0u64);
     for filler in list_fillers(storage, dir.handle).await? {
         storage.delete(filler.handle).await?;
+        removed += 1;
+        bytes += filler.size;
         on_event(Event::Deleted {
             name: filler.filename,
             bytes: filler.size,
@@ -574,7 +630,7 @@ where
 
     let free = measure(storage).await?;
     on_event(Event::Finished { free });
-    Ok(free)
+    Ok(CleanReport { free, removed, bytes })
 }
 
 #[cfg(test)]

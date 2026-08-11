@@ -246,6 +246,15 @@ async fn status(dir_name: &str) -> Result<()> {
             );
             // Anything else in there is the user's, and `clean` will leave it — say so
             // here rather than letting them discover the folder survived and wonder why.
+            // Grouped by size: the trim granularity available after a fill is
+            // exactly the set of small objects the final approach laid down.
+            let mut by_size: std::collections::BTreeMap<u64, usize> = Default::default();
+            for f in &fillers {
+                *by_size.entry(f.size).or_default() += 1;
+            }
+            for (size, count) in by_size.iter().rev() {
+                println!("  {count} x {}", human_bytes(*size));
+            }
             let foreign = engine::list_foreign(&storage, dir.handle).await?;
             for other in &foreign {
                 println!("  (not ours, will be left alone: {})", other.filename);
@@ -402,7 +411,7 @@ async fn clean(dir_name: &str) -> Result<()> {
     let device = open().await?;
     let mut storage = writable_storage(&device).await?;
     let mut removed = 0u64;
-    let free = engine::clean(&mut storage, dir_name, |event| match event {
+    let report = engine::clean(&mut storage, dir_name, |event| match event {
         Event::Deleted { name, bytes } => {
             removed += bytes;
             println!("  deleted {name} ({})", human_bytes(bytes));
@@ -411,6 +420,16 @@ async fn clean(dir_name: &str) -> Result<()> {
         _ => {}
     })
     .await?;
-    println!("reclaimed {} — {} free", human_bytes(removed), human_bytes(free));
+    if report.removed == 0 {
+        println!("nothing to remove in {dir_name}");
+        for f in engine::find_filler_folders(&storage).await? {
+            println!("  filler is in {}: {} in {} file(s)", f.name, human_bytes(f.bytes), f.files);
+        }
+    }
+    println!(
+        "reclaimed {} — {} free",
+        human_bytes(removed),
+        human_bytes(report.free)
+    );
     Ok(())
 }

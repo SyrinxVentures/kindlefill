@@ -21,9 +21,10 @@ pub mod rate;
 pub mod zeros;
 
 pub use engine::{
-    clean, delete_staged_updates, fill, fill_with_cancel, find_fill_dir, list_fillers,
+    clean, delete_staged_updates, fill, fill_with_cancel, find_fill_dir, find_filler_folders,
+    list_fillers,
     list_foreign, list_staged_updates, purge_fill_dir, validate_dir_name, Event, FillError,
-    NameError, Outcome, DEFAULT_FILL_DIR,
+    CleanReport, FillerFolder, NameError, Outcome, DEFAULT_FILL_DIR,
 };
 pub use plan::{next_step, Step, Window, WindowError, GIB, KIB, MIB};
 pub use rate::{human_duration, human_eta, FillProgress, RateEstimator};

@@ -10,9 +10,13 @@
     --surface: #ffffff;   /* the window's content plane */
     --well: #f4f5f7;      /* recessed: inputs, the log, callouts */
     --ink: #16171a;
-    --muted: #5c626b;     /* 6.4:1 on surface, 6.1:1 on well — passes on both */
+    --muted: #5c626b;     /* 6.15:1 on surface, 5.64:1 on well — measured, passes both */
     --line: #dfe1e5;
-    --line-strong: #c8ccd2;
+    /* Carries 3.2:1 on the surface. It is the *only* thing that marks an input's
+       edge — the field's own fill is 1.09:1 against the page — so at the old #c8ccd2
+       (1.6:1) the boundary of a text field was below the non-text contrast floor and
+       the field was identifiable mostly by guessing. */
+    --line-strong: #8c9299;
 
     /* Solid-fill colours carry their own foreground. A single --accent used as both
        text and button background is how the dark theme ended up with white-on-#6a9bff
@@ -26,6 +30,7 @@
     /* Caution surface. Text is a dark shade of the surface's own hue rather than a
        neutral grey, which always looks washed out on a tint. */
     --warn-surface: #fdf6ea; --warn-line: #e6d3ad; --warn-ink: #6b4400;
+    --warn-dot: #b57d00;
 
     --focus: rgba(42, 99, 216, .4);
 
@@ -39,13 +44,14 @@
       --ink: #e8eaed;
       --muted: #a0a6ae;
       --line: #32353b;
-      --line-strong: #43474e;
+      --line-strong: #767c86;
 
       --accent: #6a9bff; --accent-on: #0c1120; --accent-hover: #82adff;
       --ok: #4ec98a;
       --bad: #ff7a72; --bad-on: #2a0a08; --bad-hover: #ff9a94;
 
       --warn-surface: #262015; --warn-line: #4b3f26; --warn-ink: #f2cd92;
+      --warn-dot: #d9a441;
 
       --focus: rgba(106, 155, 255, .5);
     }
@@ -86,12 +92,46 @@
     position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
     overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
   }
-  .row { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; }
-  .row .k { color: var(--muted); }
-  .row .v { font-variant-numeric: tabular-nums; }
+  /* A description list, not rows of spans: these are name/value pairs, and to a screen
+     reader the old markup was an undifferentiated run of text. */
+  .facts { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; }
+  .facts dt { color: var(--muted); }
+  .facts dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
   .status { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; font-weight: 500; }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
   .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
+  /* Read-only is not a failure — the cable is fine and the device answered. It is a
+     third state, and painting it with the same red as "no Kindle found" told the user
+     something had broken when nothing had. */
+  .dot.warn { background: var(--warn-dot); }
+
+  /* What is on the Kindle, and how much of it is ours.
+     The product's whole idea is free space converging on a narrow band, and until now
+     nothing drew it — five numbers standing in one arithmetic relationship were five
+     unrelated rows. Deliberately a *composition* view rather than a distance-to-target
+     view: the target window is ~70 MB of 25 GB, which is a third of a pixel wide, so
+     drawing it to scale would be a lie dressed as precision. What this can show
+     honestly is the split, and the split is the thing no other utility would draw:
+     during a fill you watch our band grow and free space shrink toward the mark. */
+  .capacity {
+    display: flex; height: 14px; margin: 12px 0 6px; border-radius: 999px;
+    overflow: hidden; background: var(--well); border: 1px solid var(--line);
+  }
+  .capacity > span { display: block; transition: width var(--dur) var(--ease); }
+  .cap-used { background: var(--line-strong); }
+  .cap-filler { background: var(--accent); }
+  .cap-free { background: transparent; }
+  .cap-key {
+    display: flex; flex-wrap: wrap; gap: 4px 14px; margin-bottom: 10px;
+    font-size: 12px; color: var(--muted);
+  }
+  .cap-key > span { display: flex; align-items: center; gap: 6px; }
+  /* A swatch, so the key is readable without relying on colour alone being matched
+     from memory across the width of the window. */
+  .cap-key i { width: 9px; height: 9px; border-radius: 2px; flex: none; }
+  .cap-key .k-used i { background: var(--line-strong); }
+  .cap-key .k-filler i { background: var(--accent); }
+  .cap-key .k-free i { background: var(--well); border: 1px solid var(--line-strong); }
   label { color: var(--muted); display: block; margin-bottom: 4px; }
   .targets { display: flex; gap: 10px; align-items: flex-end; }
   .targets > div { flex: 1; }
@@ -105,15 +145,28 @@
     outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus);
   }
   input:disabled { opacity: .55; cursor: default; }
-  input[type=checkbox] { accent-color: var(--accent); }
-  .ack { display: flex; align-items: flex-start; gap: 7px; margin: 8px 0 0; color: inherit; }
-  .ack input { margin: 3px 0 0; flex: none; }
+  input[type=checkbox] { accent-color: var(--accent); width: 15px; height: 15px; }
+  /* The stylesheet's other focus rules match text and number inputs and buttons, none
+     of which is a checkbox — so the gate on permanently deleting someone's files was
+     the one control falling back to whatever the host webview draws. */
+  input[type=checkbox]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  /* Padding, not decoration: the label is the hit target (it wraps the box), and at the
+     bare line height that target was 21px tall — under the 24px floor. */
+  .ack {
+    display: flex; align-items: flex-start; gap: 8px; margin: 6px 0 0;
+    padding: 4px 0; color: inherit; cursor: pointer;
+  }
+  .ack input { margin: 2px 0 0; flex: none; }
   /* A recessed well, not a nested card: no shadow, a surface *darker* than the plane
      it sits on, so it reads as inset. Each one keeps its own action inside it —
      a destructive button in the row below would be separated from the only thing on
      screen that says what it deletes. */
+  /* `--line-strong`, not `--line`: in the dark theme the well is *darker* than the
+     plane it sits on, so a hairline border was the only thing separating a callout
+     from the background and it was too faint to do the job. The same information
+     should not carry less signal in one theme than the other. */
   .callout {
-    background: var(--well); border: 1px solid var(--line);
+    background: var(--well); border: 1px solid var(--line-strong);
     border-radius: var(--r-md); padding: 11px 13px; margin-top: 12px;
   }
   .callout--warn {
@@ -124,6 +177,11 @@
   .names {
     margin: 6px 0 0; padding-left: 18px;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+    /* The log wraps its filenames and this list didn't, though both are monospace
+       surfaces showing the same kind of name. A staged firmware image is long enough
+       to push the window sideways at zoom, and a name that runs off the edge is a name
+       the user is being asked to approve deleting without being able to read it. */
+    overflow-wrap: anywhere;
   }
   .names li + li { margin-top: 2px; }
   .buttons { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
@@ -138,24 +196,48 @@
   button:active:not(:disabled) { background: var(--line); }
   button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   button:disabled { opacity: .4; cursor: default; }
+  /* A disabled primary keeps its fill at .4 opacity, which in the dark theme is a
+     lavender that pulls harder than the *enabled* outlined button beside it — during a
+     fill the brightest thing in the row was the dead control. Dropped to neutral so
+     disabled reads as disabled in both themes. */
+  button.primary:disabled {
+    background: var(--well); border-color: var(--line-strong); color: var(--ink);
+  }
   button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-on); }
   button.primary:hover:not(:disabled),
   button.primary:active:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
   button.danger { background: var(--bad); border-color: var(--bad); color: var(--bad-on); }
   button.danger:hover:not(:disabled),
   button.danger:active:not(:disabled) { background: var(--bad-hover); border-color: var(--bad-hover); }
+  /* `flex: none` is load-bearing, not tidiness. These are items of the column flex
+     that owns the log, and with the default `flex-shrink: 1` every pixel the log
+     couldn't give up came out of the bar instead: at the app's own minimum window a
+     single callout drove it 8px -> 2px, and with border-box and 1px borders the fill
+     inside it reached *zero*. The one continuous signal of a seventeen-minute
+     operation was invisible exactly when the window was tight enough to need it. */
   .bar {
-    height: 8px; background: var(--well); border: 1px solid var(--line);
+    flex: none;
+    height: 10px; background: var(--well); border: 1px solid var(--line);
     border-radius: 999px; overflow: hidden; margin: 2px 0 10px;
   }
   .bar > i {
     display: block; height: 100%; width: 0; background: var(--accent);
     border-radius: inherit; transition: width var(--dur) var(--ease);
   }
-  .meta { display: flex; justify-content: space-between; gap: 12px; font-variant-numeric: tabular-nums; }
+  .meta {
+    flex: none;
+    display: flex; justify-content: space-between; gap: 12px;
+    font-variant-numeric: tabular-nums;
+  }
   /* During a fill this is the primary reading on screen, so it gets ink, not grey. */
   #p-left { font-weight: 500; }
   #p-right { color: var(--muted); }
+  /* The end of a seventeen-minute wait is the part a person remembers, and it used to
+     be indistinguishable from the middle — the bar and the rate kept their last values
+     forever, so a stopped fill sat there advertising a time remaining. These say which
+     of the three endings happened. */
+  #p-left.done { color: var(--ok); }
+  #p-left.failed { color: var(--bad); }
   #log {
     flex: 1 1 auto; min-height: 60px; margin-top: 10px;
     overflow-y: auto; background: var(--well); border: 1px solid var(--line);
@@ -166,7 +248,10 @@
   /* Teaches what the empty box is for rather than sitting there blank. */
   #log:empty::before { content: "Activity from the device appears here."; color: var(--muted); }
   .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
-  .note.strong { color: var(--ink); }
+  /* Body size, not fine print: this is the sentence a person reads before deciding to
+     give up the next seventeen minutes, and it was set smaller than the labels above
+     it. Also carries the app's one statement of what it is for. */
+  .note.strong { color: var(--ink); font-size: 14px; }
   .callout--warn .note { color: inherit; }
   .note.warn { color: var(--warn-ink); }
   @media (prefers-color-scheme: dark) { .note.warn { color: var(--warn-ink); } }
@@ -176,14 +261,44 @@
 <body>
   <h1 class="sr-only">KindleFill</h1>
 
-  <section class="block">
+  <section class="block" aria-label="Device">
     <div class="status"><span class="dot" id="dot"></span><span id="devline">Looking for a Kindle…</span></div>
+    <div class="note" id="devhint"></div>
     <div id="devinfo" class="hidden">
-      <div class="row"><span class="k">Storage</span><span class="v" id="d-storage">—</span></div>
-      <div class="row"><span class="k">Capacity</span><span class="v" id="d-total">—</span></div>
-      <div class="row"><span class="k">Free now</span><span class="v" id="d-free">—</span></div>
-      <div class="row"><span class="k">Filler folder</span><span class="v" id="d-dir">—</span></div>
-      <div class="row"><span class="k">Existing filler</span><span class="v" id="d-filler">—</span></div>
+      <!-- Decorative: every figure it draws is stated in the list below, so a screen
+           reader gets the numbers rather than a shape it cannot see. -->
+      <div class="capacity" id="capacity" aria-hidden="true">
+        <span class="cap-used" id="cap-used"></span>
+        <span class="cap-filler" id="cap-filler"></span>
+        <span class="cap-free" id="cap-free"></span>
+      </div>
+      <div class="cap-key" aria-hidden="true">
+        <span class="k-used"><i></i>Everything else</span>
+        <span class="k-filler"><i></i>Filler this tool wrote</span>
+        <span class="k-free"><i></i>Free</span>
+      </div>
+
+      <dl class="facts">
+        <dt>Free now</dt><dd id="d-free">—</dd>
+        <dt>Filler this tool wrote</dt><dd id="d-filler">—</dd>
+        <dt>Filler folder</dt><dd id="d-dir">—</dd>
+        <dt>Capacity</dt><dd id="d-total">—</dd>
+        <dt>Storage</dt><dd id="d-storage">—</dd>
+      </dl>
+
+      <div class="callout callout--warn hidden" id="foreignwarn">
+        <div class="note" id="foreigntext"></div>
+        <ul class="names" id="foreignlist"></ul>
+        <label class="ack"><input type="checkbox" id="overwrite" /> <span id="overwritelabel"></span></label>
+      </div>
+
+      <div class="callout callout--warn hidden" id="readonlywarn">
+        <div class="note">
+          The Kindle answered, but its storage is refusing writes. That usually means an
+          interrupted transfer left the MTP session wedged. Unplug and replug the cable;
+          if that doesn't clear it, hold the power button and restart the Kindle.
+        </div>
+      </div>
 
       <div class="callout hidden" id="updatewarn">
         <div class="note" id="updatetext"></div>
@@ -194,12 +309,6 @@
       <div class="callout hidden" id="elsewhere">
         <div class="note" id="elsewheretext"></div>
         <div class="buttons"><button id="useelsewhere">Use that folder</button></div>
-      </div>
-
-      <div class="callout callout--warn hidden" id="foreignwarn">
-        <div class="note" id="foreigntext"></div>
-        <ul class="names" id="foreignlist"></ul>
-        <label class="ack"><input type="checkbox" id="overwrite" /> <span id="overwritelabel"></span></label>
       </div>
 
       <div id="dirbox" class="hidden" style="margin-top:12px">
@@ -215,7 +324,7 @@
     </div>
   </section>
 
-  <section class="block">
+  <section class="block" aria-label="Target and actions">
     <div class="targets">
       <div><label for="low">Leave at least (MB)</label><input type="number" id="low" value="50" min="1" step="1" /></div>
       <div><label for="high">…and at most (MB)</label><input type="number" id="high" value="90" min="2" step="1" /></div>
@@ -225,11 +334,11 @@
     <div class="buttons">
       <button class="primary" id="fill" disabled>Fill</button>
       <button id="stop" disabled>Stop</button>
-      <button id="clean" disabled>Remove Fill Folder &amp; Fill Content</button>
+      <button id="clean" disabled>Remove filler &amp; folder</button>
     </div>
   </section>
 
-  <section class="block grow">
+  <section class="block grow" aria-label="Progress">
     <div class="bar" role="progressbar" aria-label="Fill progress"
          aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="bar">
       <i id="barfill"></i>
@@ -293,20 +402,51 @@ function blockedByForeign() {
 /// before you press Fill; the backend rejects it regardless.
 const MIN_WIDTH = 4 * MB;
 
-function validate() {
+/// The one reading of "is this window usable", and it decides without drawing anything.
+///
+/// Three callers need the answer — the warning line, the estimate, and updateControls —
+/// and they used to work it out separately. Two of them agreed and the third had never
+/// heard of the question, which is why Fill stayed clickable on a range the click
+/// handler would then silently refuse: a live primary button that did nothing at all.
+function rangeError() {
   const { low, high } = readWindow();
+  if (!$('low').value.trim() || !$('high').value.trim()) return 'Enter both bounds.';
+  if (!(low > 0) || !(high > 0)) return 'Both bounds have to be above zero.';
+  if (low >= high) return 'The lower bound must be below the upper bound.';
+  if (high - low < MIN_WIDTH) return 'That range is too narrow to hit reliably — leave at least 4 MB between them.';
+  // The device is the ceiling. Without this, asking for 900 GB on a 25 GB Kindle got a
+  // cheerful "Takes seconds." and an armed Fill button for something no hardware
+  // present could do.
+  if (device && high > device.total) {
+    return `That's more than the Kindle holds — it has ${device.total_human} in total.`;
+  }
+  return '';
+}
+
+/// Draw whatever `rangeError` decided. Separate from the decision so that asking the
+/// question can never be a side effect.
+function showRangeError() {
+  const msg = rangeError();
   const warn = $('rangewarn');
-  let msg = '';
-  if (!(low > 0) || !(high > 0)) msg = 'Enter both bounds.';
-  else if (low >= high) msg = 'The lower bound must be below the upper bound.';
-  else if (high - low < MIN_WIDTH) msg = 'That range is too narrow to hit reliably — leave at least 4 MB between them.';
   warn.textContent = msg;
   warn.classList.toggle('hidden', !msg);
-  return !msg;
 }
 
 function estimate() {
-  if (!device || !validate()) { $('estimate').textContent = '—'; return; }
+  if (!device) {
+    $('estimate').textContent = 'Connect a Kindle to see how long a fill would take.';
+    return;
+  }
+  // Quoting a transfer time for storage that is refusing writes is the app agreeing
+  // with a plan it has already greyed out the button for.
+  if (!device.writable) {
+    $('estimate').textContent = 'Nothing can be written until the storage accepts writes again.';
+    return;
+  }
+  if (rangeError()) {
+    $('estimate').textContent = 'Set a target range above to see how long a fill would take.';
+    return;
+  }
   const { low, high } = readWindow();
   const aim = low + (high - low) / 2;
   if (device.free >= low && device.free <= high) {
@@ -344,9 +484,15 @@ function updateControls() {
   const usable = !!device && device.writable;
   // A detect holds the device exactly as an operation does, so it locks the same set.
   const locked = busy || detecting;
+  // Armed to delete files this tool didn't write. The button says so below.
+  const armed = !!device && device.foreign.length > 0 && $('overwrite').checked;
 
-  $('fill').disabled = locked || !usable || blockedByForeign();
-  $('clean').disabled = locked || !device || device.filler_files === 0;
+  // `rangeError()` belongs here and was missing: the click handler refused an invalid
+  // range while this said the button was fine, so Fill looked alive and did nothing.
+  $('fill').disabled = locked || !usable || blockedByForeign() || !!rangeError();
+  // `writable` was missing here too, though Fill has always had it — so a read-only
+  // Kindle greyed out Fill and left the button that deletes things fully live.
+  $('clean').disabled = locked || !usable || device.filler_files === 0;
   $('refresh').disabled = locked;
   // `busy` alone, and it does not latch off when pressed. The backend publishes the
   // cancel token only once the device is open, so a Stop landing in the second or two
@@ -364,6 +510,26 @@ function updateControls() {
   $('useelsewhere').disabled = locked;
   $('delupdates').disabled = locked || !device || device.updates.length === 0;
   $('overwrite').disabled = locked;
+
+  // A control names its own action. Ticking Overwrite used to change nothing about
+  // Fill — same label, same blue, same size as the Fill that writes into an empty
+  // folder — so the one irreversible act in the app was fired by a button that gave no
+  // sign of what it was about to do. Meanwhile deleting a firmware image, which Amazon
+  // will happily send again, turned red and demanded a second click. The stronger
+  // signal was on the weaker consequence.
+  $('fill').textContent = armed ? 'Overwrite & Fill' : 'Fill';
+  $('fill').classList.toggle('danger', armed);
+  $('fill').classList.toggle('primary', !armed);
+
+  // The pre-flight estimate describes work that hasn't started. During a fill the
+  // progress row carries a live figure two lines below it, and two disagreeing time
+  // estimates on one screen means at least one of them is wrong.
+  $('estimate').classList.toggle('hidden', busy);
+
+  // An idle progressbar is still a progressbar to a screen reader — it announced 0% for
+  // an operation nobody had started. The track stays visible so the region doesn't jump
+  // when a fill begins; it just stops claiming to measure anything.
+  $('bar').setAttribute('aria-hidden', String(!busy));
 }
 
 function setBusy(on) {
@@ -371,11 +537,38 @@ function setBusy(on) {
   updateControls();
 }
 
+/// One owner of "the progress row is no longer describing something that is running".
+///
+/// Clean reset the bar, the reading and the rate; Fill reset none of them. So a
+/// finished fill kept its bar at whatever width it stopped at, and a *stopped* fill sat
+/// there indefinitely announcing a throughput and a time remaining for an operation
+/// that had ended. `tone` picks which of the three endings this was.
+function endProgress(line, tone) {
+  // Always back to zero, including on success: the bar means "an operation is running
+  // and is this far through it". Leaving it full would be a second thing on screen
+  // claiming something is in flight when nothing is.
+  $('barfill').style.width = '0%';
+  $('bar').setAttribute('aria-valuenow', '0');
+  $('bar').removeAttribute('aria-valuetext');
+  $('p-left').textContent = line;
+  $('p-left').className = tone === 'idle' ? '' : tone;
+  $('p-right').textContent = '';
+}
+
+/// Capped, because the list sits inside a callout and a folder someone has been using
+/// for years can hold hundreds of files — enough to push every button in the window off
+/// the bottom of the screen. The count is still exact; only the enumeration is bounded.
+const NAMES_SHOWN = 6;
 function fillList(el, items) {
   el.textContent = '';
-  for (const it of items) {
+  for (const it of items.slice(0, NAMES_SHOWN)) {
     const li = document.createElement('li');
     li.textContent = `${it.name} (${it.human})`;
+    el.appendChild(li);
+  }
+  if (items.length > NAMES_SHOWN) {
+    const li = document.createElement('li');
+    li.textContent = `…and ${items.length - NAMES_SHOWN} more`;
     el.appendChild(li);
   }
 }
@@ -391,6 +584,22 @@ function paintLiveRows(d) {
   $('d-filler').textContent = d.filler_files
     ? `${d.filler_files} file${d.filler_files === 1 ? '' : 's'}, ${d.filler_human}`
     : 'none';
+  paintCapacity(d);
+}
+
+/// Draw the split: what was already on the Kindle, what this tool put there, what's
+/// left. The one picture in the app that no other utility would draw, and the only
+/// place the product's actual subject — space filling up — is visible rather than
+/// arithmetic the reader has to do across five rows.
+function paintCapacity(d) {
+  if (!d.total) return;
+  const filler = Math.min(d.filler_bytes, d.total);
+  const free = Math.min(d.free, d.total - filler);
+  const used = Math.max(0, d.total - filler - free);
+  const pct = (n) => `${((n / d.total) * 100).toFixed(2)}%`;
+  $('cap-used').style.width = pct(used);
+  $('cap-filler').style.width = pct(filler);
+  $('cap-free').style.width = pct(free);
 }
 
 /// Apply one engine event's worth of change, so the panel tracks a running fill
@@ -421,8 +630,27 @@ function humanBytes(bytes) {
 
 function renderDevice(d) {
   device = d;
-  $('dot').className = 'dot ' + (d.writable ? 'ok' : 'bad');
-  $('devline').textContent = d.writable ? 'Kindle connected' : 'Kindle connected (storage is read-only)';
+  // Three states, not two. Read-only isn't a failure — the cable is fine and the device
+  // answered — so painting it the same red as "no Kindle found" said something had
+  // broken when nothing had.
+  $('dot').className = 'dot ' + (d.writable ? 'ok' : 'warn');
+  $('devline').textContent = d.writable ? 'Kindle connected' : 'Kindle connected — storage is read-only';
+  $('readonlywarn').classList.toggle('hidden', d.writable);
+  // The app's one statement of what it is for, shown while there is nothing of ours on
+  // the device — which is exactly when someone is meeting it for the first time and
+  // deciding whether two numbers in megabytes are the right two numbers. It goes away
+  // once there is filler, because by then the question has been answered.
+  //
+  // Also withheld while a callout is up. Those are specific and actionable and this is
+  // general; stacking the two pushes the buttons off the bottom of a small window, and
+  // between "what is this app for" and "there is a firmware update sitting on your
+  // device", the second one is what the moment is about.
+  const quiet = d.foreign.length === 0 && d.updates.length === 0
+    && (!d.elsewhere || d.elsewhere.length === 0) && d.writable;
+  setHint(d.filler_files === 0 && quiet
+    ? 'Filling the storage leaves too little room for the Kindle to download a firmware '
+      + 'update. Turn on Airplane Mode as well — this stops the download, not the check.'
+    : '');
   $('devinfo').classList.remove('hidden');
   $('d-storage').textContent = d.storage;
   $('d-total').textContent = d.total_human;
@@ -457,14 +685,21 @@ function renderDevice(d) {
     $('overwrite').checked = false;
   }
 
-  // Stated, not editorialized: it's the user's device and possibly their own file.
+  // Stated, not editorialized: it's the user's device and possibly their own file. But
+  // stating the fact without stating what it means for the task in hand left two things
+  // on screen and no sentence joining them — the user is here to stop an update, and an
+  // already-downloaded one is the case where filling cannot help.
   const staged = d.updates.length > 0;
   $('updatewarn').classList.toggle('hidden', !staged);
+  $('updatewarn').classList.toggle('callout--warn', staged);
   disarmDelete();
   if (staged) {
-    $('updatetext').textContent = staged && d.updates.length === 1
-      ? 'A downloaded firmware update is on the device:'
-      : 'Downloaded firmware updates are on the device:';
+    const one = d.updates.length === 1;
+    $('updatetext').textContent = one
+      ? 'A firmware update is already downloaded and will install on the next restart. '
+        + "Filling won't stop it — the bytes are already here. Remove it first:"
+      : 'Firmware updates are already downloaded and will install on the next restart. '
+        + "Filling won't stop them — the bytes are already here. Remove them first:";
     fillList($('updatelist'), d.updates);
   }
 
@@ -472,16 +707,31 @@ function renderDevice(d) {
   estimate();
 }
 
+/// The line under the status dot. One writer, so a hint left over from one state can't
+/// survive into another.
+function setHint(text) {
+  $('devhint').textContent = text;
+  $('devhint').classList.toggle('hidden', !text);
+}
+
 /// One painter for "there is no usable device", so the unplug watcher and a failed
 /// detect can't drift into describing the same state two different ways.
-function showNoDevice(line) {
+///
+/// `hint` sits directly under the diagnosis. It used to go to the log instead — the
+/// remedy for "no Kindle found" was 12px monospace at the far end of the window, in a
+/// box captioned "Activity from the device appears here", which is not where a person
+/// looks for what to do next.
+function showNoDevice(line, hint) {
   device = null;
   $('dot').className = 'dot bad';
   $('devline').textContent = line;
+  setHint(hint || '');
   $('devinfo').classList.add('hidden');
   $('updatewarn').classList.add('hidden');
   $('elsewhere').classList.add('hidden');
+  $('readonlywarn').classList.add('hidden');
   updateControls();
+  estimate();
 }
 
 async function refresh() {
@@ -494,7 +744,8 @@ async function refresh() {
   try {
     renderDevice(await invoke('detect', { dirName: dirName() }));
   } catch (e) {
-    showNoDevice('No Kindle found');
+    showNoDevice('No Kindle found', 'Plug the Kindle in with a data cable and press Refresh. '
+      + 'If it is already plugged in, unlock the screen — a locked Kindle does not answer.');
     log(String(e));
   } finally {
     detecting = false;
@@ -520,7 +771,12 @@ listen('kindlefill://progress', (e) => {
 });
 
 $('refresh').onclick = refresh;
-for (const id of ['low', 'high']) $(id).oninput = estimate;
+// All three, every edit. Wiring only `estimate` here is half of why an invalid range
+// left Fill live: even once updateControls knew about the range, nothing re-ran it
+// when the range changed.
+for (const id of ['low', 'high']) {
+  $(id).oninput = () => { showRangeError(); estimate(); updateControls(); };
+}
 
 /// Mirrors validate_dir_name in engine.rs. Checked here so a bad name says so in
 /// place, rather than travelling to the backend and coming back as a failed detect —
@@ -621,23 +877,36 @@ $('delupdates').onclick = async () => {
 };
 
 $('fill').onclick = async () => {
-  if (!validate() || blockedByForeign()) return;
+  // updateControls owns this now; kept as an assertion, because the cost of the two
+  // disagreeing was a button that looked alive and did nothing.
+  if (rangeError() || blockedByForeign()) return;
   const { low, high } = readWindow();
   setBusy(true);
   $('barfill').style.width = '0%';
   $('bar').setAttribute('aria-valuenow', '0');
+  $('p-left').className = '';
+  $('p-left').textContent = 'Starting…';
+  $('p-right').textContent = '';
+  let ending = ['Idle', 'idle'];
   try {
-    log(await invoke('start_fill', {
+    const outcome = await invoke('start_fill', {
       low, high, dirName: dirName(),
       // The token identifying the exact foreign listing shown above the tick, not a
       // bare true. The backend re-derives it from the device and refuses if the folder
       // has changed, so a confirmation can't be spent on contents nobody was shown.
       overwrite: $('overwrite').checked ? device.overwrite_token : null,
-    }));
+    });
+    log(outcome);
+    // The engine's own sentence — "Done — 68.4 MB free, inside the target window." or
+    // "Stopped at … — Fill again to resume." It already says the right thing; the
+    // failure was that only the log ever showed it.
+    ending = [outcome, outcome.startsWith('Stopped') ? 'idle' : 'done'];
   } catch (e) {
     log('Error: ' + String(e));
+    ending = ['Failed — see the log below.', 'failed'];
   } finally {
     setBusy(false);
+    endProgress(ending[0], ending[1]);
     await refresh();
   }
 };
@@ -649,14 +918,17 @@ $('stop').onclick = async () => {
 
 $('clean').onclick = async () => {
   setBusy(true);
+  let ending = ['Idle', 'idle'];
   try {
-    log(await invoke('start_clean', { dirName: dirName() }));
+    const outcome = await invoke('start_clean', { dirName: dirName() });
+    log(outcome);
+    ending = [outcome, 'done'];
   } catch (e) {
     log('Error: ' + String(e));
+    ending = ['Failed — see the log below.', 'failed'];
   } finally {
     setBusy(false);
-    $('barfill').style.width = '0%';
-    $('p-left').textContent = 'Idle'; $('p-right').textContent = '';
+    endProgress(ending[0], ending[1]);
     await refresh();
   }
 };
@@ -682,7 +954,8 @@ setInterval(async () => {
     log('Kindle reconnected.');
     await refresh();
   } else {
-    showNoDevice('Kindle unplugged');
+    showNoDevice('Kindle unplugged', 'Anything already written is still on the device. '
+      + 'Replug the cable and press Refresh — Fill picks up where it stopped.');
     log('Kindle unplugged.');
   }
 }, PRESENCE_POLL_MS);

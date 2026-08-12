@@ -14,7 +14,10 @@
   .fail { color: #b3261e; font-weight: 600; white-space: nowrap; }
   .why  { color: #b3261e; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
   #tally { margin-top: 16px; font-weight: 600; }
-  iframe { display: none; }
+  /* Off-screen, not `display: none`. A hidden iframe has no layout, so every
+     getBoundingClientRect inside it reads 0 — which silently turns the size assertions
+     into tests of nothing. */
+  iframe { position: fixed; left: -10000px; top: 0; border: 0; }
 </style>
 </head>
 <body>
@@ -44,13 +47,18 @@ const SNAPSHOT = {
   foreign: [], overwrite_token: null, updates: [], elsewhere: [],
 };
 
+/// The window the app ships with, and its floor — `tauri.conf.json`. Sizes matter to
+/// these tests: the progress bar used to collapse to zero height at the floor.
+const WINDOW = { w: 620, h: 800 };
+const MIN_WINDOW = { w: 520, h: 640 };
+
 const FOREIGN = [{ name: 'mybook.azw3', bytes: 4096, human: '4.00 KB' }];
 const UPDATE = [{ name: 'update_kindle.bin', bytes: 1048576, human: '1.00 MB' }];
 
 /// Boot the app in an iframe with `overrides` applied to the snapshot `detect` returns.
 /// `hang` names commands whose promise never settles, which is how an operation is held
 /// open long enough to inspect the controls mid-flight.
-async function boot(overrides, hang = []) {
+async function boot(overrides, hang = [], size = WINDOW) {
   // `no-store`, or the browser serves the copy it already had and the suite silently
   // tests the last version of the app rather than this one — which is a test suite
   // that cannot go red, the worst kind.
@@ -74,7 +82,11 @@ async function boot(overrides, hang = []) {
     };
   <\/script>`;
 
+  // Sized to a real app window. The layout assertions below are about what fits, and
+  // an iframe left at its default size measures a window nobody has.
   const frame = document.createElement('iframe');
+  frame.width = size.w;
+  frame.height = size.h;
   frame.srcdoc = source.replace('</head>', stub + '</head>');
   document.body.appendChild(frame);
   await new Promise((r) => frame.addEventListener('load', r, { once: true }));
@@ -144,7 +156,7 @@ test('Fill stays disabled during a fill, including after re-ticking Overwrite', 
 // ---------------------------------------------------------------------------
 test('Fill stays disabled on read-only storage after an operation ends', async () => {
   const t = await boot({ writable: false, updates: UPDATE });
-  is(t.g('devline').textContent, 'Kindle connected (storage is read-only)', 'header');
+  is(t.g('devline').textContent, 'Kindle connected — storage is read-only', 'header');
   is(t.g('fill').disabled, true, '#fill on read-only storage');
 
   // A real busy cycle that runs to completion: arm, confirm, let it finish.
@@ -189,6 +201,72 @@ test('An unconfirmed fill sends no token at all', async () => {
   t.g('fill').click();
   await t.tick();
   is(t.args().start_fill.overwrite, null, 'nothing was confirmed, so nothing is claimed');
+});
+
+// ---------------------------------------------------------------------------
+// The bar is a flex item next to a log that also wants the space. With the default
+// flex-shrink it lost every pixel the log wouldn't give up, and at the app's own
+// minimum window a single callout drove the fill inside it to zero height — no
+// progress indication at all, for the whole seventeen minutes.
+// ---------------------------------------------------------------------------
+test('The progress bar keeps its height at the smallest window the app allows', async () => {
+  for (const overrides of [{}, { updates: UPDATE }, { foreign: FOREIGN, overwrite_token: 't' }]) {
+    const t = await boot(overrides, ['start_fill'], MIN_WINDOW);
+    const h = t.g('barfill').getBoundingClientRect().height;
+    if (h < 4) {
+      throw new Error(`#barfill collapsed to ${h}px with ${JSON.stringify(overrides)}`);
+    }
+  }
+});
+
+test('Fill is disabled, not merely ignored, when the range is unusable', async () => {
+  const t = await boot({});
+  is(t.g('fill').disabled, false, '#fill with the default range');
+
+  // Too narrow to hit: the click handler has always refused this, and the button used
+  // to stay live and do nothing at all when pressed.
+  t.g('high').value = '52';
+  t.g('high').dispatchEvent(new t.win.Event('input', { bubbles: true }));
+  await t.tick();
+  is(t.g('fill').disabled, true, '#fill on a too-narrow range');
+
+  // Wider than the device. Nothing compared the window against capacity, so this got a
+  // cheerful "Takes seconds." and an armed button.
+  t.g('high').value = '900000';
+  t.g('high').dispatchEvent(new t.win.Event('input', { bubbles: true }));
+  await t.tick();
+  is(t.g('fill').disabled, true, '#fill on a range larger than the device');
+});
+
+test('Remove is disabled on read-only storage, like Fill', async () => {
+  const t = await boot({ writable: false });
+  is(t.g('fill').disabled, true, '#fill on read-only storage');
+  is(t.g('clean').disabled, true, '#clean on read-only storage');
+});
+
+test('Fill says what it is about to do once Overwrite is confirmed', async () => {
+  const t = await boot({ foreign: FOREIGN, overwrite_token: 'tok' });
+  is(t.g('fill').textContent, 'Fill', 'the label before confirming');
+  t.g('overwrite').click();
+  await t.tick();
+  is(t.g('fill').textContent, 'Overwrite & Fill', 'the label once armed');
+  is(t.g('fill').classList.contains('danger'), true, '#fill carries .danger once armed');
+});
+
+// ---------------------------------------------------------------------------
+// The guardrail. updateControls() carries a comment claiming it is the only writer of
+// .disabled, and that claim has already been false twice — the second time it cost a
+// primary button that looked alive and did nothing. A comment cannot fail a build.
+// ---------------------------------------------------------------------------
+test('updateControls is the only thing in the module that assigns .disabled', async () => {
+  const source = await (await fetch('../index.html', { cache: 'no-store' })).text();
+  const body = source.slice(source.indexOf('function updateControls'));
+  const owner = body.slice(0, body.indexOf('\n}\n'));
+  const total = (source.match(/\.disabled = /g) || []).length;
+  const inOwner = (owner.match(/\.disabled = /g) || []).length;
+  if (total !== inOwner) {
+    throw new Error(`${total - inOwner} assignment(s) to .disabled outside updateControls`);
+  }
 });
 
 // ---------------------------------------------------------------------------

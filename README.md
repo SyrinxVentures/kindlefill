@@ -49,7 +49,7 @@ The GUI has since been run against the same device, driven end to end:
 | Progress during a 1 GiB object | 317 events, **largest gap 0.215 s** — the bar never freezes |
 | Stop, pressed mid-object | Responded in **under 0.9 s**, including deleting the partial object |
 | Fill again after Stop | Resumed — wrote `fill_0001.bin`, not `fill_0000.bin` |
-| Remove Fill Folder & Fill Content | Free space returned to its starting value; `fill_disk` removed |
+| Remove filler & folder | Free space returned to its starting value; `fill_disk` removed |
 
 Those runs used a window shifted ~2.5 GB below current free space rather than the
 50–90 MB default. Same code path — the ladder still lays down 1 GiB objects, so Stop is
@@ -304,7 +304,7 @@ cd crates/kindlefill-app/ui && python3 -m http.server 8000
 # then open http://localhost:8000/tests/controls.html
 ```
 
-Wiring a headless browser into CI is a bigger dependency than six assertions currently
+Wiring a headless browser into CI is a bigger dependency than eleven assertions currently
 justify. Until that changes, a green CI badge says nothing about the frontend, so it
 shouldn't be read as if it does.
 
@@ -345,7 +345,7 @@ the cases that must survive.
 
 ## What has and hasn't been exercised on hardware
 
-Fill, Stop, resume, and Remove Fill Folder & Fill Content have all been run against a Paperwhite Signature
+Fill, Stop, resume, and Remove filler & folder have all been run against a Paperwhite Signature
 Edition (see Status). Three paths have not, and are covered only by the test suite:
 
 - **`ptpcamerad` taming** — the daemon wasn't running on the test machine.

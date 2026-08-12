@@ -9,7 +9,7 @@ edition = "2021"
 # patent grant; MIT is the shorter, more universally recognized option. Downstream
 # users take whichever their situation calls for.
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/avrignaud/kindlefill"
+repository = "https://github.com/SyrinxVentures/kindlefill"
 
 [workspace.dependencies]
 mtp-rs = "0.30"

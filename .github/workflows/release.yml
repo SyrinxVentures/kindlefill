@@ -33,13 +33,44 @@ jobs:
       - name: Install the Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
 
+      # Signed with the Syrinx Ventures Developer ID and sent to Apple's notary service,
+      # so a downloaded build opens on a double-click instead of sending people into
+      # System Settings. Tauri reads all five of these from the environment: given
+      # APPLE_CERTIFICATE it imports the .p12 into a temporary keychain, signs with the
+      # hardened runtime, then notarizes and staples.
+      #
+      # If the secrets are absent — a fork, or a dry run — this still produces a working
+      # ad-hoc signed DMG. It just needs the Privacy & Security dance to open, which is
+      # what the release notes below describe when `signed` is false.
       - name: Build the app bundle and DMG
         working-directory: crates/kindlefill-app
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: cargo tauri build
 
-      # Ad-hoc signed, not notarized: that needs a paid Apple Developer account, which
-      # this project does not have. The release notes tell people what to do about it.
-      - name: Publish the release
+      # Asked of the artifact rather than assumed from the secrets being set: signing can
+      # succeed and notarization still fail, and a release that claims to open cleanly
+      # when it doesn't is worse than one that admits it.
+      - name: Check whether the bundle really is notarized
+        id: gate
+        run: |
+          APP=target/release/bundle/macos/KindleFill.app
+          if spctl --assess --type execute --verbose=4 "$APP" 2>&1 | grep -q "accepted"; then
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+            echo "Gatekeeper accepts the bundle."
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Bundle is not notarized; release notes will say so."
+          fi
+          codesign -dv --verbose=4 "$APP" 2>&1 | sed -n '1,8p' || true
+
+      - name: Publish the release (notarized)
+        if: steps.gate.outputs.signed == 'true'
         uses: softprops/action-gh-release@v2
         with:
           files: target/release/bundle/dmg/*.dmg
@@ -50,9 +81,28 @@ jobs:
             Download the `.dmg` below, open it, and drag KindleFill to Applications.
             **Apple silicon only.**
 
-            The app is ad-hoc signed but **not notarized**, so macOS quarantines it on
-            download. Since macOS Sequoia, right-click → Open no longer works for
-            unnotarized apps. What does:
+            Signed and notarized by Syrinx Ventures, so it opens on a double-click.
+
+            ---
+
+            *Not created or endorsed by Amazon. Kindle and Amazon are trademarks of
+            Amazon.com, Inc. or its affiliates.*
+
+      - name: Publish the release (unnotarized fallback)
+        if: steps.gate.outputs.signed != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/bundle/dmg/*.dmg
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            Download the `.dmg` below, open it, and drag KindleFill to Applications.
+            **Apple silicon only.**
+
+            This build is **not notarized**, so macOS quarantines it on download. Since
+            macOS Sequoia, right-click → Open no longer works for unnotarized apps. What
+            does:
 
             1. Double-click KindleFill. macOS refuses. Click **Done** — not *Move to Trash*.
             2. **System Settings → Privacy & Security**, scroll to the bottom, click

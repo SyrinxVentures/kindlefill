@@ -17,13 +17,18 @@ remaining.](docs/screenshot.png)
 ## Install
 
 Download the latest **KindleFill_*_aarch64.dmg** from
-[Releases](https://github.com/avrignaud/kindlefill/releases/latest), open it, and drag
+[Releases](https://github.com/SyrinxVentures/kindlefill/releases/latest), open it, and drag
 KindleFill to Applications. Apple silicon only; see [Platforms](#platforms) below.
 
-**The first launch takes an extra step, and it is not the one you remember.** The app is
-ad-hoc signed but *not* notarized — notarizing needs a paid Apple Developer account — so
-macOS quarantines it on download. On macOS Sequoia and later, right-click → Open no
-longer works for unnotarized apps. What does:
+Released builds are signed with a Developer ID and notarized by Apple, so they open on a
+double-click with no warning to dismiss.
+
+<details>
+<summary>If macOS blocks it anyway</summary>
+
+That means you have an unnotarized build — one you compiled yourself, or from before
+notarization was set up. macOS quarantines anything downloaded, and since macOS Sequoia
+the old right-click → Open escape no longer works. What does:
 
 1. Double-click KindleFill. macOS says it can't be opened. Click **Done** — not *Move to
    Trash*.
@@ -38,8 +43,8 @@ double-click the app again to bring it back. Or, from a terminal:
 xattr -d com.apple.quarantine /Applications/KindleFill.app
 ```
 
-Prefer to skip all of that? [Build it yourself](#the-app) — a locally built bundle is
-never quarantined.
+A bundle you build locally is never quarantined in the first place.
+</details>
 
 ## Platforms
 
@@ -155,12 +160,19 @@ target/release/bundle/macos/KindleFill.app      drag to /Applications
 target/release/bundle/dmg/KindleFill_0.1.0_aarch64.dmg
 ```
 
-The bundle is **ad-hoc signed**, not notarized. Built locally it opens by double-click,
-because macOS only quarantines files that arrive from elsewhere. Downloaded from
-Releases it is quarantined, and since macOS Sequoia the old right-click → Open escape
-no longer works for unnotarized apps — see [Install](#install) for what does. Shipping
-something that opens on the first double-click needs a Developer ID and notarization,
-which needs a paid Apple Developer account; this project doesn't have one.
+A local build is **ad-hoc signed** and opens by double-click, because macOS only
+quarantines files that arrive from elsewhere. Releases are a different build: the
+workflow signs them with a Developer ID and sends them to Apple's notary service, which
+is what lets a *downloaded* copy open without the Privacy & Security detour.
+
+Notarization needs five secrets on the repository — `APPLE_CERTIFICATE` (a
+base64-encoded Developer ID Application `.p12`), `APPLE_CERTIFICATE_PASSWORD`,
+`APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD` (an app-specific password, not
+the account password) and `APPLE_TEAM_ID`. Without them the workflow still produces a
+working DMG; it just isn't notarized, and the release notes say so rather than claiming
+otherwise. The workflow asks `spctl` whether Gatekeeper actually accepts the bundle and
+picks its release notes from the answer, so a failed notarization can't be published as
+a successful one.
 
 The `-p kindlefill-app` above is the crate; the binary it produces is `KindleFill`.
 Unbundled, macOS takes the Dock and app-menu label from the executable name, so

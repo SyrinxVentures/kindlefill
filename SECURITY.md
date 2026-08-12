@@ -2,7 +2,7 @@
 
 ## Reporting
 
-Use [GitHub's private vulnerability reporting](https://github.com/avrignaud/kindlefill/security/advisories/new)
+Use [GitHub's private vulnerability reporting](https://github.com/SyrinxVentures/kindlefill/security/advisories/new)
 rather than a public issue. There is one maintainer and no service-level agreement — you
 will get a human reply, not a fast one.
 

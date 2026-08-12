@@ -1,0 +1,69 @@
+name: Release
+
+# Tag-driven, so the artifact people download is built from a commit CI has already
+# passed rather than from whatever was on a laptop that afternoon.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  dmg:
+    # Apple silicon runner, which is what the DMG is built for. There is no Intel build
+    # because there is no Intel Mac to test one on — see the README's Platforms section.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      # The same three gates CI runs. A tag should not be able to ship something that
+      # would have failed a pull request.
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+      - name: Install the Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build the app bundle and DMG
+        working-directory: crates/kindlefill-app
+        run: cargo tauri build
+
+      # Ad-hoc signed, not notarized: that needs a paid Apple Developer account, which
+      # this project does not have. The release notes tell people what to do about it.
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/bundle/dmg/*.dmg
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            Download the `.dmg` below, open it, and drag KindleFill to Applications.
+            **Apple silicon only.**
+
+            The app is ad-hoc signed but **not notarized**, so macOS quarantines it on
+            download. Since macOS Sequoia, right-click → Open no longer works for
+            unnotarized apps. What does:
+
+            1. Double-click KindleFill. macOS refuses. Click **Done** — not *Move to Trash*.
+            2. **System Settings → Privacy & Security**, scroll to the bottom, click
+               **Open Anyway**.
+            3. Confirm with your password.
+
+            That button only appears for about an hour after a blocked launch. Or from a
+            terminal: `xattr -d com.apple.quarantine /Applications/KindleFill.app`.
+            Building from source avoids all of this — a local build is never quarantined.
+
+            ---
+
+            *Not created or endorsed by Amazon. Kindle and Amazon are trademarks of
+            Amazon.com, Inc. or its affiliates.*

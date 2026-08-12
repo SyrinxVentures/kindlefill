@@ -260,6 +260,7 @@
   .callout--warn .note { color: inherit; }
   .note.warn { color: var(--warn-ink); }
   @media (prefers-color-scheme: dark) { .note.warn { color: var(--warn-ink); } }
+  .disclaimer { color: var(--muted); font-size: 11px; margin: 12px 0 0; }
   .hidden { display: none; }
 </style>
 </head>
@@ -327,6 +328,13 @@
       <button id="refresh">Refresh</button>
       <button id="rename" aria-expanded="false" aria-controls="dirbox">Change folder…</button>
     </div>
+    <!-- Amazon's trademark guidelines ask for this wherever their marks appear in a
+         third-party product name. It sits inside the panel that scrolls, so it costs
+         nothing from the fixed area where the buttons live. -->
+    <p class="disclaimer">
+      Not created or endorsed by Amazon. Kindle and Amazon are trademarks of
+      Amazon.com, Inc. or its affiliates.
+    </p>
   </section>
 
   <section class="block" aria-label="Target and actions">

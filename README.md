@@ -6,12 +6,46 @@ device can't download an OTA firmware update, and removes the filler again after
 Targets modern MTP Kindles (11th gen and newer — 2024 Paperwhite, Colorsoft, Scribe,
 basic 2024), which no longer mount as USB mass storage.
 
-**Platforms.** macOS is the only one this has ever been compiled or run on. Windows and
-Linux are not "supported but untested" — they are untried. The code carries real
-affordances for both (`windows_subsystem`, a no-op `ptpcamerad` off macOS, an `.ico` in
-the bundle set), which makes it look like someone checked, and nobody has. The unknown
-isn't this app's code, it's whether `mtp-rs`'s WPD and libusb backends behave the way
-the macOS one does. Reports either way are welcome.
+> **Not created or endorsed by Amazon.** KindleFill is an independent, free, open-source
+> tool. *Kindle* and *Amazon* are trademarks of Amazon.com, Inc. or its affiliates, used
+> here only to say which device this works with.
+
+## Install
+
+Download the latest **KindleFill_*_aarch64.dmg** from
+[Releases](https://github.com/avrignaud/kindlefill/releases/latest), open it, and drag
+KindleFill to Applications. Apple silicon only; see [Platforms](#platforms) below.
+
+**The first launch takes an extra step, and it is not the one you remember.** The app is
+ad-hoc signed but *not* notarized — notarizing needs a paid Apple Developer account — so
+macOS quarantines it on download. On macOS Sequoia and later, right-click → Open no
+longer works for unnotarized apps. What does:
+
+1. Double-click KindleFill. macOS says it can't be opened. Click **Done** — not *Move to
+   Trash*.
+2. Open **System Settings → Privacy & Security**, scroll to the bottom, and click
+   **Open Anyway** next to the message about KindleFill.
+3. Confirm with your password.
+
+That button only appears for about an hour after a blocked launch; if it isn't there,
+double-click the app again to bring it back. Or, from a terminal:
+
+```bash
+xattr -d com.apple.quarantine /Applications/KindleFill.app
+```
+
+Prefer to skip all of that? [Build it yourself](#the-app) — a locally built bundle is
+never quarantined.
+
+## Platforms
+
+macOS is the only one this has ever been compiled or run on, and the released DMG is
+**Apple silicon only** — no Intel build, because there is no Intel Mac here to test one
+on. Windows and Linux are not "supported but untested"; they are untried. The code
+carries real affordances for both (`windows_subsystem`, a no-op `ptpcamerad` off macOS,
+an `.ico` in the bundle set), which makes it look like someone checked, and nobody has.
+The unknown isn't this app's code, it's whether `mtp-rs`'s WPD and libusb backends
+behave the way the macOS one does. Reports either way are welcome.
 
 **Sizes are binary.** 1 GB here means 1 GiB — 1024³ bytes — throughout: the CLI's
 `--low 50MB`, the app's fields, and every figure printed. So the capacity shown for a
@@ -117,11 +151,12 @@ target/release/bundle/macos/KindleFill.app      drag to /Applications
 target/release/bundle/dmg/KindleFill_0.1.0_aarch64.dmg
 ```
 
-The bundle is **ad-hoc signed**, not notarized. Built locally it opens by
-double-click, because macOS only quarantines files that arrive from elsewhere. Sent
-to anyone else it will be quarantined and Gatekeeper will refuse it until they
-right-click → Open — so a build for other people needs a Developer ID and
-notarization, not just this command.
+The bundle is **ad-hoc signed**, not notarized. Built locally it opens by double-click,
+because macOS only quarantines files that arrive from elsewhere. Downloaded from
+Releases it is quarantined, and since macOS Sequoia the old right-click → Open escape
+no longer works for unnotarized apps — see [Install](#install) for what does. Shipping
+something that opens on the first double-click needs a Developer ID and notarization,
+which needs a paid Apple Developer account; this project doesn't have one.
 
 The `-p kindlefill-app` above is the crate; the binary it produces is `KindleFill`.
 Unbundled, macOS takes the Dock and app-menu label from the executable name, so
@@ -351,3 +386,14 @@ Edition (see Status). Three paths have not, and are covered only by the test sui
 - **`ptpcamerad` taming** — the daemon wasn't running on the test machine.
 - **Deleting a staged firmware update** — no update was staged on the test device.
 - **Overwrite** — the test folder never held foreign content.
+
+Two more caveats, both about *when* those runs happened. They were made against an
+earlier build, before the interface was reworked — the capacity bar, the terminal
+progress state, the armed-overwrite button and the range guards have been exercised
+against a stubbed backend in a browser and by the test suites, but not against a Kindle.
+And the released bundle itself has not been launched: its contents are verified by
+decompressing the embedded frontend and by 68 Rust tests, which is not the same as
+double-clicking it.
+
+If you run it against real hardware, an issue saying what happened — good or bad — is
+the single most useful thing you could contribute.

@@ -10,6 +10,10 @@ basic 2024), which no longer mount as USB mass storage.
 > tool. *Kindle* and *Amazon* are trademarks of Amazon.com, Inc. or its affiliates, used
 > here only to say which device this works with.
 
+![The KindleFill window during a fill: a bar showing how much of the Kindle is filler
+this tool wrote, the target range, and a live progress reading with throughput and time
+remaining.](docs/screenshot.png)
+
 ## Install
 
 Download the latest **KindleFill_*_aarch64.dmg** from

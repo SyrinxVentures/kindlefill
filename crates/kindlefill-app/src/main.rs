@@ -547,9 +547,12 @@ async fn start_fill(
             "Done — {} free, inside the target window.",
             human_bytes(free)
         )),
+        // Names the button as it is labelled on screen. Renaming the control without
+        // this left the one message that tells someone how to recover pointing at a
+        // button that no longer existed.
         engine::Outcome::Overfilled { free, excess } => Ok(format!(
-            "Overfilled: {} free, {} below target. Use Remove Fill Folder & Fill \
-             Content to recover.",
+            "Overfilled: {} free, {} below target. Use Remove filler & folder to \
+             recover.",
             human_bytes(free),
             human_bytes(excess)
         )),

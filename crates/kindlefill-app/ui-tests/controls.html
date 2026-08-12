@@ -23,11 +23,15 @@
 <body>
 <h1>Control-state tests</h1>
 <p class="lede">
-  Runs against the real <code>../index.html</code> — not a copy, which would drift — with
-  the Tauri bridge stubbed. Serve this directory and open the page:
-  <code>cd crates/kindlefill-app/ui &amp;&amp; python3 -m http.server 8000</code>, then
-  <code>localhost:8000/tests/controls.html</code>. It needs a server because the page
+  Runs against the real <code>../ui/index.html</code> — not a copy, which would drift —
+  with the Tauri bridge stubbed. Serve the crate directory and open the page:
+  <code>cd crates/kindlefill-app &amp;&amp; python3 -m http.server 8000</code>, then
+  <code>localhost:8000/ui-tests/controls.html</code>. It needs a server because the page
   fetches the app's own HTML, which <code>file://</code> forbids.
+  <br /><br />
+  This lives beside <code>ui/</code> rather than inside it because
+  <code>tauri.conf.json</code> sets <code>frontendDist: "ui"</code>, which embeds
+  everything under that directory into the shipped binary — the harness included.
 </p>
 <table id="out"></table>
 <div id="tally">running…</div>
@@ -62,7 +66,7 @@ async function boot(overrides, hang = [], size = WINDOW) {
   // `no-store`, or the browser serves the copy it already had and the suite silently
   // tests the last version of the app rather than this one — which is a test suite
   // that cannot go red, the worst kind.
-  const source = await (await fetch('../index.html', { cache: 'no-store' })).text();
+  const source = await (await fetch('../ui/index.html', { cache: 'no-store' })).text();
   const config = JSON.stringify({ snapshot: { ...SNAPSHOT, ...overrides }, hang });
   const stub = `<script>
     const CONFIG = ${config};
@@ -259,7 +263,7 @@ test('Fill says what it is about to do once Overwrite is confirmed', async () =>
 // primary button that looked alive and did nothing. A comment cannot fail a build.
 // ---------------------------------------------------------------------------
 test('updateControls is the only thing in the module that assigns .disabled', async () => {
-  const source = await (await fetch('../index.html', { cache: 'no-store' })).text();
+  const source = await (await fetch('../ui/index.html', { cache: 'no-store' })).text();
   const body = source.slice(source.indexOf('function updateControls'));
   const owner = body.slice(0, body.indexOf('\n}\n'));
   const total = (source.match(/\.disabled = /g) || []).length;

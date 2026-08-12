@@ -33,6 +33,18 @@ jobs:
       - name: Install the Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
 
+      # Tauri wants a *path* to the App Store Connect key, and a hosted runner has no
+      # such file — so if the key is provided as a secret, write it out and hand over
+      # the path. Skipped entirely when the Apple ID method is being used instead.
+      - name: Materialize the App Store Connect key
+        if: ${{ secrets.APPLE_API_KEY_P8 != '' }}
+        run: |
+          mkdir -p ~/.appstoreconnect/private_keys
+          KEY=~/.appstoreconnect/private_keys/AuthKey_${{ secrets.APPLE_API_KEY }}.p8
+          printf '%s' "${{ secrets.APPLE_API_KEY_P8 }}" > "$KEY"
+          chmod 600 "$KEY"
+          echo "APPLE_API_KEY_PATH=$KEY" >> "$GITHUB_ENV"
+
       # Signed with the Syrinx Ventures Developer ID and sent to Apple's notary service,
       # so a downloaded build opens on a double-click instead of sending people into
       # System Settings. Tauri reads all five of these from the environment: given
@@ -57,7 +69,7 @@ jobs:
           # password to a human's account.
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_KEY_PATH: ${{ secrets.APPLE_API_KEY_PATH }}
+          # APPLE_API_KEY_PATH is set by the step above when a key secret is present.
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}

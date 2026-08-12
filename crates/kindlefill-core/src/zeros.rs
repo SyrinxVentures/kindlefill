@@ -82,7 +82,14 @@ mod tests {
     #[tokio::test]
     async fn yields_exactly_the_requested_length() {
         // The declared size must match the bytes sent, or the device rejects the object.
-        for len in [0u64, 1, 4096, CHUNK as u64, CHUNK as u64 + 1, 5 * CHUNK as u64] {
+        for len in [
+            0u64,
+            1,
+            4096,
+            CHUNK as u64,
+            CHUNK as u64 + 1,
+            5 * CHUNK as u64,
+        ] {
             let (total, _) = drain(len).await;
             assert_eq!(total, len, "length mismatch for {len}");
         }

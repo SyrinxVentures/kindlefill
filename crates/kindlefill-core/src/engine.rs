@@ -42,7 +42,9 @@ pub enum NameError {
     Empty,
     /// Contains a character that isn't a filename, or a leading/trailing space that
     /// would make the folder impossible to identify on the device.
-    Illegal { name: String },
+    Illegal {
+        name: String,
+    },
 }
 
 impl std::fmt::Display for NameError {
@@ -72,9 +74,9 @@ pub fn validate_dir_name(name: &str) -> Result<(), NameError> {
     }
     let illegal = name != name.trim()
         || name.chars().all(|c| c == '.')
-        || name
-            .chars()
-            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'));
+        || name.chars().any(|c| {
+            c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        });
     if illegal {
         return Err(NameError::Illegal {
             name: name.to_string(),
@@ -116,10 +118,15 @@ pub enum Outcome {
 #[derive(Debug)]
 pub enum FillError {
     /// The storage reported itself read-only.
-    ReadOnly { description: String },
+    ReadOnly {
+        description: String,
+    },
     /// Not enough free space to reach the window — the device is already fuller
     /// than the target. Distinct from `Overfilled`: nothing was written.
-    AlreadyBelowWindow { free: u64, low: u64 },
+    AlreadyBelowWindow {
+        free: u64,
+        low: u64,
+    },
     /// The requested filler folder name isn't usable.
     BadName(NameError),
     Mtp(Error),
@@ -166,10 +173,7 @@ async fn measure(storage: &mut Storage) -> Result<u64, Error> {
 ///
 /// Root only, and an exact name match. Nothing in this module ever recurses looking
 /// for a folder to operate on — the one folder it will touch is the one named here.
-pub async fn find_fill_dir(
-    storage: &Storage,
-    dir_name: &str,
-) -> Result<Option<ObjectInfo>, Error> {
+pub async fn find_fill_dir(storage: &Storage, dir_name: &str) -> Result<Option<ObjectInfo>, Error> {
     let objects = storage.list_objects(Some(ObjectHandle::ROOT)).await?;
     Ok(objects
         .into_iter()
@@ -281,10 +285,7 @@ fn filler_sequence(filename: &str) -> Option<u32> {
 ///
 /// Only files this tool would have written are matched. Anything else in the folder
 /// is left strictly alone — `clean` must never delete a stray book.
-pub async fn list_fillers(
-    storage: &Storage,
-    dir: ObjectHandle,
-) -> Result<Vec<ObjectInfo>, Error> {
+pub async fn list_fillers(storage: &Storage, dir: ObjectHandle) -> Result<Vec<ObjectInfo>, Error> {
     let mut fillers: Vec<ObjectInfo> = storage
         .list_objects(Some(dir))
         .await?
@@ -350,10 +351,7 @@ pub struct CleanReport {
 
 /// Everything in `fill_disk` that is *not* ours, so a caller can refuse to touch a
 /// folder someone else's content is living in.
-pub async fn list_foreign(
-    storage: &Storage,
-    dir: ObjectHandle,
-) -> Result<Vec<ObjectInfo>, Error> {
+pub async fn list_foreign(storage: &Storage, dir: ObjectHandle) -> Result<Vec<ObjectInfo>, Error> {
     Ok(storage
         .list_objects(Some(dir))
         .await?
@@ -639,7 +637,11 @@ where
     let Some(dir) = find_fill_dir(storage, dir_name).await? else {
         let free = measure(storage).await?;
         on_event(Event::Finished { free });
-        return Ok(CleanReport { free, removed: 0, bytes: 0 });
+        return Ok(CleanReport {
+            free,
+            removed: 0,
+            bytes: 0,
+        });
     };
 
     let (mut removed, mut bytes) = (0usize, 0u64);
@@ -659,7 +661,11 @@ where
 
     let free = measure(storage).await?;
     on_event(Event::Finished { free });
-    Ok(CleanReport { free, removed, bytes })
+    Ok(CleanReport {
+        free,
+        removed,
+        bytes,
+    })
 }
 
 #[cfg(test)]
@@ -679,13 +685,21 @@ mod tests {
 
     #[test]
     fn sequence_resumes_after_the_highest_existing_filler() {
-        let existing = vec![obj("fill_0000.bin"), obj("fill_0007.bin"), obj("fill_0003.bin")];
+        let existing = vec![
+            obj("fill_0000.bin"),
+            obj("fill_0007.bin"),
+            obj("fill_0003.bin"),
+        ];
         assert_eq!(next_sequence(&existing), 8);
     }
 
     #[test]
     fn sequence_ignores_names_this_tool_did_not_write() {
-        let existing = vec![obj("mybook.azw3"), obj("fill_notanumber.bin"), obj("fill_.bin")];
+        let existing = vec![
+            obj("mybook.azw3"),
+            obj("fill_notanumber.bin"),
+            obj("fill_.bin"),
+        ];
         assert_eq!(next_sequence(&existing), 0);
     }
 
@@ -695,7 +709,12 @@ mod tests {
     /// is the guard against deleting someone's book.
     #[test]
     fn only_names_this_tool_would_write_are_recognized_as_filler() {
-        for ours in ["fill_0000.bin", "fill_0001.bin", "fill_9999.bin", "fill_10000.bin"] {
+        for ours in [
+            "fill_0000.bin",
+            "fill_0001.bin",
+            "fill_9999.bin",
+            "fill_10000.bin",
+        ] {
             assert_eq!(
                 filler_sequence(ours).map(|n| format!("{FILL_PREFIX}{n:04}{FILL_SUFFIX}")),
                 Some(ours.to_string()),
@@ -704,10 +723,10 @@ mod tests {
         }
         for theirs in [
             "mybook.azw3",
-            "fill_notes.bin",   // the bug: prefix+suffix matched, so it was deletable
+            "fill_notes.bin", // the bug: prefix+suffix matched, so it was deletable
             "fill_backup.bin",
             "fill_.bin",
-            "fill_12.bin",      // right number, not a name we write
+            "fill_12.bin", // right number, not a name we write
             "fill_00000007.bin",
             "fill_+001.bin",
             "fill_0001.bin.bak",

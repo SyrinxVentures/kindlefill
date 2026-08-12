@@ -10,8 +10,9 @@
 //! real world. That is what `kindlefill bench` is for.
 
 use kindlefill_core::{engine, plan::MIB, Window};
-use mtp_rs::{MtpDevice, NewObjectInfo, ObjectHandle, Storage, VirtualDeviceConfig,
-             VirtualStorageConfig};
+use mtp_rs::{
+    MtpDevice, NewObjectInfo, ObjectHandle, Storage, VirtualDeviceConfig, VirtualStorageConfig,
+};
 use std::path::Path;
 use std::time::Duration;
 
@@ -68,7 +69,9 @@ async fn fill_lands_inside_the_window() {
     let mut storage = storage_of(&device).await;
     let w = window();
 
-    let outcome = engine::fill(&mut storage, w, DIR, |_| {}).await.expect("fill");
+    let outcome = engine::fill(&mut storage, w, DIR, |_| {})
+        .await
+        .expect("fill");
 
     match outcome {
         engine::Outcome::InWindow { free } => {
@@ -102,7 +105,10 @@ async fn fill_creates_the_fill_disk_folder_and_reports_progress() {
         .expect("fill_disk should exist");
     assert_eq!(dir.filename, DIR);
     assert_eq!(
-        engine::list_fillers(&storage, dir.handle).await.unwrap().len(),
+        engine::list_fillers(&storage, dir.handle)
+            .await
+            .unwrap()
+            .len(),
         written
     );
     assert!(tmp.path().join(DIR).is_dir(), "should exist on disk");
@@ -115,14 +121,25 @@ async fn clean_reclaims_everything_fill_consumed() {
     let mut storage = storage_of(&device).await;
 
     let before = free_space(&mut storage).await;
-    engine::fill(&mut storage, window(), DIR, |_| {}).await.expect("fill");
+    engine::fill(&mut storage, window(), DIR, |_| {})
+        .await
+        .expect("fill");
     assert!(free_space(&mut storage).await < before);
 
-    engine::clean(&mut storage, DIR, |_| {}).await.expect("clean");
+    engine::clean(&mut storage, DIR, |_| {})
+        .await
+        .expect("clean");
 
-    assert_eq!(free_space(&mut storage).await, before, "should fully reclaim");
+    assert_eq!(
+        free_space(&mut storage).await,
+        before,
+        "should fully reclaim"
+    );
     assert!(
-        engine::find_fill_dir(&storage, DIR).await.unwrap().is_none(),
+        engine::find_fill_dir(&storage, DIR)
+            .await
+            .unwrap()
+            .is_none(),
         "empty fill_disk should be removed too"
     );
 }
@@ -190,7 +207,9 @@ async fn fill_resumes_from_an_existing_partial_fill() {
     let mut storage = storage_of(&device).await;
     let w = window();
 
-    engine::fill(&mut storage, w, DIR, |_| {}).await.expect("first fill");
+    engine::fill(&mut storage, w, DIR, |_| {})
+        .await
+        .expect("first fill");
     let dir = engine::find_fill_dir(&storage, DIR).await.unwrap().unwrap();
     let first_pass = engine::list_fillers(&storage, dir.handle).await.unwrap();
 
@@ -200,7 +219,9 @@ async fn fill_resumes_from_an_existing_partial_fill() {
     storage.delete(last.handle).await.expect("delete");
     assert!(!w.contains(free_space(&mut storage).await));
 
-    engine::fill(&mut storage, w, DIR, |_| {}).await.expect("second fill");
+    engine::fill(&mut storage, w, DIR, |_| {})
+        .await
+        .expect("second fill");
 
     assert!(w.contains(free_space(&mut storage).await));
     let after: Vec<_> = engine::list_fillers(&storage, dir.handle)
@@ -212,7 +233,11 @@ async fn fill_resumes_from_an_existing_partial_fill() {
     let mut unique = after.clone();
     unique.sort();
     unique.dedup();
-    assert_eq!(unique.len(), after.len(), "filenames must not collide: {after:?}");
+    assert_eq!(
+        unique.len(),
+        after.len(),
+        "filenames must not collide: {after:?}"
+    );
     // The surviving objects from the first pass were not rewritten.
     for name in names_before.iter().take(names_before.len() - 1) {
         assert!(after.contains(name), "{name} should have been kept");
@@ -234,7 +259,11 @@ async fn a_precancelled_token_writes_nothing() {
         .expect("cancelling is not an error");
 
     assert!(matches!(outcome, engine::Outcome::Cancelled { .. }));
-    assert_eq!(free_space(&mut storage).await, before, "must not have written");
+    assert_eq!(
+        free_space(&mut storage).await,
+        before,
+        "must not have written"
+    );
 }
 
 /// Stopping a 17-minute fill has to leave the device in a state you can pick back up
@@ -263,11 +292,16 @@ async fn cancelling_mid_fill_leaves_a_resumable_state() {
 
     assert!(matches!(outcome, engine::Outcome::Cancelled { .. }));
     let mid = free_space(&mut storage).await;
-    assert!(mid < before, "should have made real progress before stopping");
+    assert!(
+        mid < before,
+        "should have made real progress before stopping"
+    );
     assert!(!w.contains(mid), "should have stopped short of the target");
 
     // The decisive property: a plain re-run finishes the job.
-    let outcome = engine::fill(&mut storage, w, DIR, |_| {}).await.expect("resume");
+    let outcome = engine::fill(&mut storage, w, DIR, |_| {})
+        .await
+        .expect("resume");
     assert!(matches!(outcome, engine::Outcome::InWindow { .. }));
     assert!(w.contains(free_space(&mut storage).await));
 
@@ -292,7 +326,9 @@ async fn clean_leaves_foreign_files_and_their_folder_alone() {
     let device = open(tmp.path()).await;
     let mut storage = storage_of(&device).await;
 
-    engine::fill(&mut storage, window(), DIR, |_| {}).await.expect("fill");
+    engine::fill(&mut storage, window(), DIR, |_| {})
+        .await
+        .expect("fill");
     let dir = engine::find_fill_dir(&storage, DIR).await.unwrap().unwrap();
 
     // Things someone dropped into fill_disk. The last three are the ones that matter:
@@ -316,7 +352,9 @@ async fn clean_leaves_foreign_files_and_their_folder_alone() {
             .unwrap_or_else(|_| panic!("upload {name}"));
     }
 
-    engine::clean(&mut storage, DIR, |_| {}).await.expect("clean");
+    engine::clean(&mut storage, DIR, |_| {})
+        .await
+        .expect("clean");
 
     let dir = engine::find_fill_dir(&storage, DIR)
         .await
@@ -332,7 +370,10 @@ async fn clean_leaves_foreign_files_and_their_folder_alone() {
     remaining.sort();
     let mut expected: Vec<String> = foreign.iter().map(|s| s.to_string()).collect();
     expected.sort();
-    assert_eq!(remaining, expected, "clean deleted something that wasn't ours");
+    assert_eq!(
+        remaining, expected,
+        "clean deleted something that wasn't ours"
+    );
 }
 
 #[tokio::test]
@@ -357,7 +398,10 @@ async fn refuses_to_fill_a_device_already_below_the_window() {
         other => panic!("expected AlreadyBelowWindow, got {other:?}"),
     }
     assert!(
-        engine::find_fill_dir(&storage, DIR).await.unwrap().is_none(),
+        engine::find_fill_dir(&storage, DIR)
+            .await
+            .unwrap()
+            .is_none(),
         "must not leave an empty fill_disk behind after refusing"
     );
 }
@@ -397,8 +441,20 @@ async fn deleting_staged_updates_removes_only_named_root_level_images() {
     // Two real update images, plus three files that must survive: one that only looks
     // like an update, one book, and one genuine-shaped image nested inside a folder
     // rather than at the root.
-    put(&storage, ObjectHandle::ROOT, "update_kindle_pw5_5.18.1.bin", 4096).await;
-    put(&storage, ObjectHandle::ROOT, "update_kindle_other.bin", 4096).await;
+    put(
+        &storage,
+        ObjectHandle::ROOT,
+        "update_kindle_pw5_5.18.1.bin",
+        4096,
+    )
+    .await;
+    put(
+        &storage,
+        ObjectHandle::ROOT,
+        "update_kindle_other.bin",
+        4096,
+    )
+    .await;
     put(&storage, ObjectHandle::ROOT, "updates_notes.bin", 4096).await;
     put(&storage, ObjectHandle::ROOT, "mybook.azw3", 4096).await;
     let sub = storage
@@ -431,7 +487,10 @@ async fn deleting_staged_updates_removes_only_named_root_level_images() {
         .expect("delete");
 
     assert_eq!(
-        removed.iter().map(|o| o.filename.as_str()).collect::<Vec<_>>(),
+        removed
+            .iter()
+            .map(|o| o.filename.as_str())
+            .collect::<Vec<_>>(),
         vec!["update_kindle_pw5_5.18.1.bin"],
         "a name that isn't a root-level staged image must delete nothing"
     );
@@ -463,9 +522,16 @@ async fn filler_and_foreign_partition_the_folder_exactly() {
     let device = open(tmp.path()).await;
     let mut storage = storage_of(&device).await;
 
-    engine::fill(&mut storage, window(), DIR, |_| {}).await.expect("fill");
+    engine::fill(&mut storage, window(), DIR, |_| {})
+        .await
+        .expect("fill");
     let dir = engine::find_fill_dir(&storage, DIR).await.unwrap().unwrap();
-    for name in ["mybook.azw3", "fill_notes.bin", "fill_12.bin", "fill_00000007.bin"] {
+    for name in [
+        "mybook.azw3",
+        "fill_notes.bin",
+        "fill_12.bin",
+        "fill_00000007.bin",
+    ] {
         put(&storage, dir.handle, name, 1024).await;
     }
     storage
@@ -477,20 +543,32 @@ async fn filler_and_foreign_partition_the_folder_exactly() {
     let fillers = engine::list_fillers(&storage, dir.handle).await.unwrap();
     let foreign = engine::list_foreign(&storage, dir.handle).await.unwrap();
 
-    assert_eq!(fillers.len() + foreign.len(), all, "must partition, not overlap or drop");
+    assert_eq!(
+        fillers.len() + foreign.len(),
+        all,
+        "must partition, not overlap or drop"
+    );
     assert_eq!(foreign.len(), 5, "4 files plus the folder");
     for f in &fillers {
         assert!(f.is_file(), "a folder must never be counted as filler");
-        assert!(!foreign.iter().any(|o| o.handle == f.handle), "sets must be disjoint");
+        assert!(
+            !foreign.iter().any(|o| o.handle == f.handle),
+            "sets must be disjoint"
+        );
     }
 }
 
 #[test]
 fn folder_names_that_would_escape_the_root_are_refused() {
     for ok in ["fill_disk", "my filler", "Fill-Disk_2", "a.b"] {
-        assert!(engine::validate_dir_name(ok).is_ok(), "{ok} should be allowed");
+        assert!(
+            engine::validate_dir_name(ok).is_ok(),
+            "{ok} should be allowed"
+        );
     }
-    for bad in ["", "..", ".", "a/b", "a\\b", "a:b", " lead", "trail ", "a\u{0}b", "a*b"] {
+    for bad in [
+        "", "..", ".", "a/b", "a\\b", "a:b", " lead", "trail ", "a\u{0}b", "a*b",
+    ] {
         assert!(
             engine::validate_dir_name(bad).is_err(),
             "{bad:?} must be refused"
@@ -509,7 +587,9 @@ async fn overwriting_empties_the_folder_and_nothing_outside_it() {
     // Something at the root that must survive: the purge is scoped to one named folder.
     put(&storage, ObjectHandle::ROOT, "root_book.azw3", 1024).await;
 
-    engine::fill(&mut storage, window(), DIR, |_| {}).await.expect("fill");
+    engine::fill(&mut storage, window(), DIR, |_| {})
+        .await
+        .expect("fill");
     let dir = engine::find_fill_dir(&storage, DIR).await.unwrap().unwrap();
     put(&storage, dir.handle, "mybook.azw3", 1024).await;
     // Nested, so the depth-first walk is actually exercised — MTP won't delete a
@@ -525,18 +605,30 @@ async fn overwriting_empties_the_folder_and_nothing_outside_it() {
         .await
         .expect("purge");
 
-    assert!(removed >= 4, "should have removed filler, book, folder and its child");
+    assert!(
+        removed >= 4,
+        "should have removed filler, book, folder and its child"
+    );
     let dir = engine::find_fill_dir(&storage, DIR)
         .await
         .unwrap()
         .expect("the folder itself stays — fill is about to use it");
     assert!(
-        storage.list_objects(Some(dir.handle)).await.unwrap().is_empty(),
+        storage
+            .list_objects(Some(dir.handle))
+            .await
+            .unwrap()
+            .is_empty(),
         "folder must be empty afterwards"
     );
-    assert!(free_space(&mut storage).await > before, "space must come back");
     assert!(
-        root_names(&storage).await.contains(&"root_book.azw3".to_string()),
+        free_space(&mut storage).await > before,
+        "space must come back"
+    );
+    assert!(
+        root_names(&storage)
+            .await
+            .contains(&"root_book.azw3".to_string()),
         "content outside the folder must be untouched"
     );
 }
@@ -549,7 +641,9 @@ async fn overwriting_a_folder_that_does_not_exist_is_a_no_op() {
     put(&storage, ObjectHandle::ROOT, "root_book.azw3", 1024).await;
 
     assert_eq!(
-        engine::purge_fill_dir(&mut storage, DIR, |_| {}).await.expect("purge"),
+        engine::purge_fill_dir(&mut storage, DIR, |_| {})
+            .await
+            .expect("purge"),
         0
     );
     assert_eq!(root_names(&storage).await, vec!["root_book.azw3"]);
@@ -579,12 +673,19 @@ async fn filler_is_found_whatever_the_folder_is_called() {
     put(&storage, books, "fill_notes.bin", 4096).await;
 
     let found = engine::find_filler_folders(&storage).await.expect("scan");
-    assert_eq!(found.len(), 1, "should find exactly the filler folder: {found:?}");
+    assert_eq!(
+        found.len(),
+        1,
+        "should find exactly the filler folder: {found:?}"
+    );
     assert_eq!(found[0].name, "fill_disk2112");
     assert!(found[0].files > 0 && found[0].bytes > 0);
 
     // And the default name genuinely holds nothing, which is what made this invisible.
-    assert!(engine::find_fill_dir(&storage, DIR).await.unwrap().is_none());
+    assert!(engine::find_fill_dir(&storage, DIR)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 /// `clean` aimed at the wrong folder must not claim success. Reporting only free
@@ -600,10 +701,16 @@ async fn cleaning_the_wrong_folder_reports_that_it_removed_nothing() {
         .expect("fill");
     let before = free_space(&mut storage).await;
 
-    let report = engine::clean(&mut storage, DIR, |_| {}).await.expect("clean");
+    let report = engine::clean(&mut storage, DIR, |_| {})
+        .await
+        .expect("clean");
     assert_eq!(report.removed, 0, "nothing in {DIR} to remove");
     assert_eq!(report.bytes, 0);
-    assert_eq!(free_space(&mut storage).await, before, "must not have freed anything");
+    assert_eq!(
+        free_space(&mut storage).await,
+        before,
+        "must not have freed anything"
+    );
 
     // The filler is still where it was, and still findable.
     let found = engine::find_filler_folders(&storage).await.unwrap();
@@ -628,7 +735,9 @@ async fn fill_climbs_back_up_when_it_starts_below_the_window() {
     let mut storage = storage_of(&device).await;
 
     // Land somewhere first, then ask for a window well *above* where we ended up.
-    engine::fill(&mut storage, window(), DIR, |_| {}).await.expect("fill");
+    engine::fill(&mut storage, window(), DIR, |_| {})
+        .await
+        .expect("fill");
     let low = free_space(&mut storage).await;
     assert!(window().contains(low));
 
@@ -639,7 +748,10 @@ async fn fill_climbs_back_up_when_it_starts_below_the_window() {
 
     match outcome {
         engine::Outcome::InWindow { free } => {
-            assert!(higher.contains(free), "landed at {free}, outside {higher:?}")
+            assert!(
+                higher.contains(free),
+                "landed at {free}, outside {higher:?}"
+            )
         }
         other => panic!("expected InWindow, got {other:?}"),
     }
@@ -654,7 +766,9 @@ async fn climbing_up_removes_only_filler_and_leaves_foreign_files_alone() {
     let device = open(tmp.path()).await;
     let mut storage = storage_of(&device).await;
 
-    engine::fill(&mut storage, window(), DIR, |_| {}).await.expect("fill");
+    engine::fill(&mut storage, window(), DIR, |_| {})
+        .await
+        .expect("fill");
     let dir = engine::find_fill_dir(&storage, DIR).await.unwrap().unwrap();
     put(&storage, dir.handle, "mybook.azw3", 1024).await;
     put(&storage, dir.handle, "fill_notes.bin", 1024).await;
@@ -662,7 +776,9 @@ async fn climbing_up_removes_only_filler_and_leaves_foreign_files_alone() {
 
     let low = free_space(&mut storage).await;
     let higher = Window::new(low + 8 * MIB, low + 16 * MIB).unwrap();
-    engine::fill(&mut storage, higher, DIR, |_| {}).await.expect("climb");
+    engine::fill(&mut storage, higher, DIR, |_| {})
+        .await
+        .expect("climb");
 
     let survivors: Vec<String> = engine::list_foreign(&storage, dir.handle)
         .await
@@ -670,9 +786,17 @@ async fn climbing_up_removes_only_filler_and_leaves_foreign_files_alone() {
         .into_iter()
         .map(|o| o.filename)
         .collect();
-    assert!(survivors.contains(&"mybook.azw3".to_string()), "{survivors:?}");
-    assert!(survivors.contains(&"fill_notes.bin".to_string()), "{survivors:?}");
-    assert!(root_names(&storage).await.contains(&"root_book.azw3".to_string()));
+    assert!(
+        survivors.contains(&"mybook.azw3".to_string()),
+        "{survivors:?}"
+    );
+    assert!(
+        survivors.contains(&"fill_notes.bin".to_string()),
+        "{survivors:?}"
+    );
+    assert!(root_names(&storage)
+        .await
+        .contains(&"root_book.azw3".to_string()));
 }
 
 /// Below the window with no filler of ours is genuinely unfixable, and must still say

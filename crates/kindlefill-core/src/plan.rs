@@ -250,7 +250,11 @@ mod tests {
         let w = window();
         assert_eq!(next_step(70 * MIB, w), Step::Done);
         assert_eq!(next_step(50 * MIB, w), Step::Done, "low bound is inclusive");
-        assert_eq!(next_step(90 * MIB, w), Step::Done, "high bound is inclusive");
+        assert_eq!(
+            next_step(90 * MIB, w),
+            Step::Done,
+            "high bound is inclusive"
+        );
     }
 
     #[test]
@@ -351,7 +355,10 @@ mod tests {
             free -= n;
             count += 1;
         }
-        assert!(count < 40, "took {count} objects to fill 13 GiB; too chatty");
+        assert!(
+            count < 40,
+            "took {count} objects to fill 13 GiB; too chatty"
+        );
     }
 
     #[test]
@@ -362,8 +369,8 @@ mod tests {
     #[test]
     fn prefers_a_removal_that_lands_inside_the_window_outright() {
         let w = window(); // 50-90 MiB, aim 70
-        // From 40 MiB free: +32 lands on 72, +45 lands on 85. Both are inside; 72 is
-        // nearer the aim, so it wins.
+                          // From 40 MiB free: +32 lands on 72, +45 lands on 85. Both are inside; 72 is
+                          // nearer the aim, so it wins.
         let sizes = [4 * MIB, 32 * MIB, 45 * MIB, GIB];
         assert_eq!(next_removal(40 * MIB, w, &sizes), Removal::Remove(1));
     }
@@ -433,7 +440,10 @@ mod tests {
     #[test]
     fn no_single_object_can_exceed_the_mtp_32_bit_size_field() {
         for &rung in LADDER {
-            assert!(rung < u64::from(u32::MAX), "rung {rung} overflows ObjectInfo");
+            assert!(
+                rung < u64::from(u32::MAX),
+                "rung {rung} overflows ObjectInfo"
+            );
         }
     }
 }

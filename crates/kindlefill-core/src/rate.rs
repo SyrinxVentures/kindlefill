@@ -320,7 +320,10 @@ mod tests {
         // Four seconds where nothing moves.
         r.observe(done, Duration::from_secs(9));
         let stalled = r.rate().unwrap();
-        assert!(stalled < moving * 0.5, "{stalled} should be well under {moving}");
+        assert!(
+            stalled < moving * 0.5,
+            "{stalled} should be well under {moving}"
+        );
     }
 
     /// `done` is re-derived from the device's free space each object, so it can step
@@ -333,9 +336,20 @@ mod tests {
 
         // The device reports less done than we already saw.
         r.observe(1_000_000, Duration::from_secs(6));
-        assert_eq!(r.rate(), None, "history should have been dropped, not blended");
+        assert_eq!(
+            r.rate(),
+            None,
+            "history should have been dropped, not blended"
+        );
 
-        steady(&mut r, 4_000_000, 4.0, 10.0, Duration::from_secs(6), 1_000_000);
+        steady(
+            &mut r,
+            4_000_000,
+            4.0,
+            10.0,
+            Duration::from_secs(6),
+            1_000_000,
+        );
         let rate = r.rate().expect("should recover");
         assert!(
             (rate - 4_000_000.0).abs() < 400_000.0,
@@ -385,7 +399,8 @@ mod tests {
         let (rate_after, eta_after) = (r.rate().unwrap(), r.eta(100_000_000).unwrap());
 
         let rate_change = (rate_before - rate_after) / rate_before;
-        let eta_change = (eta_after.as_secs_f64() - eta_before.as_secs_f64()) / eta_before.as_secs_f64();
+        let eta_change =
+            (eta_after.as_secs_f64() - eta_before.as_secs_f64()) / eta_before.as_secs_f64();
         assert!(
             rate_change > eta_change,
             "the displayed rate should react more sharply than the ETA \
@@ -397,7 +412,12 @@ mod tests {
 
     #[test]
     fn fraction_never_leaves_the_unit_interval() {
-        let p = |done, total| FillProgress { done, total, rate: None, eta: None };
+        let p = |done, total| FillProgress {
+            done,
+            total,
+            rate: None,
+            eta: None,
+        };
 
         assert_eq!(p(0, 100).fraction(), 0.0);
         assert_eq!(p(50, 100).fraction(), 0.5);
@@ -411,7 +431,12 @@ mod tests {
 
     #[test]
     fn remaining_floors_at_zero_when_we_overshoot() {
-        let p = FillProgress { done: 150, total: 100, rate: None, eta: None };
+        let p = FillProgress {
+            done: 150,
+            total: 100,
+            rate: None,
+            eta: None,
+        };
         assert_eq!(p.remaining(), 0);
     }
 
@@ -429,7 +454,11 @@ mod tests {
         assert_eq!(s(0), "0s");
         assert_eq!(s(43), "45s", "under a minute rounds to 5s");
         assert_eq!(s(127), "2m 10s", "under ten minutes rounds to 10s");
-        assert_eq!(s(1_016), "17m 00s", "beyond ten minutes rounds to the minute");
+        assert_eq!(
+            s(1_016),
+            "17m 00s",
+            "beyond ten minutes rounds to the minute"
+        );
         assert_eq!(s(7_325), "2h 02m");
     }
 
@@ -438,7 +467,11 @@ mod tests {
     fn a_nearly_finished_eta_never_rounds_down_to_nothing() {
         assert_eq!(human_eta(Duration::from_secs(1)), "5s");
         assert_eq!(human_eta(Duration::from_secs(2)), "5s");
-        assert_eq!(human_eta(Duration::ZERO), "0s", "only genuine zero shows zero");
+        assert_eq!(
+            human_eta(Duration::ZERO),
+            "0s",
+            "only genuine zero shows zero"
+        );
     }
 
     /// The display should hold still while the underlying estimate wobbles inside its

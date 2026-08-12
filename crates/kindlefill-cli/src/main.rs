@@ -7,15 +7,16 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use kindlefill_core::{
-    engine, human_bytes, is_exclusive_access, ptpcamerad, Event, Window, MIB,
-};
+use kindlefill_core::{engine, human_bytes, is_exclusive_access, ptpcamerad, Event, Window, MIB};
 use mtp_rs::{CancelToken, MtpDevice, NewObjectInfo, ObjectHandle, Storage};
 use std::io::{self, IsTerminal};
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(name = "kindlefill", about = "Fill a Kindle's storage to block OTA updates")]
+#[command(
+    name = "kindlefill",
+    about = "Fill a Kindle's storage to block OTA updates"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -77,7 +78,12 @@ async fn main() -> Result<()> {
         Command::Probe => probe().await,
         Command::Bench => bench().await,
         Command::Status { dir } => status(&dir).await,
-        Command::Fill { low, high, dir, overwrite } => fill(low, high, &dir, overwrite).await,
+        Command::Fill {
+            low,
+            high,
+            dir,
+            overwrite,
+        } => fill(low, high, &dir, overwrite).await,
         Command::Clean { dir } => clean(&dir).await,
     }
 }
@@ -177,9 +183,16 @@ async fn bench() -> Result<()> {
         .context("could not create a folder at the storage root")?;
 
     let mut written = Vec::new();
-    for (label, size) in [("16MiB", 16 * MIB), ("128MiB", 128 * MIB), ("512MiB", 512 * MIB)] {
+    for (label, size) in [
+        ("16MiB", 16 * MIB),
+        ("128MiB", 128 * MIB),
+        ("512MiB", 512 * MIB),
+    ] {
         let name = format!("bench_{label}.bin");
-        let before = { storage.refresh().await?; storage.info().free_space };
+        let before = {
+            storage.refresh().await?;
+            storage.info().free_space
+        };
 
         let start = Instant::now();
         let handle = storage
@@ -286,9 +299,10 @@ fn render_progress(p: &kindlefill_core::FillProgress, tty: bool) {
     let eta = p
         .eta
         .map_or_else(|| "estimating".to_string(), kindlefill_core::human_eta);
-    let rate = p
-        .rate
-        .map_or_else(|| "--".to_string(), |r| format!("{:.1} MB/s", r / MIB as f64));
+    let rate = p.rate.map_or_else(
+        || "--".to_string(),
+        |r| format!("{:.1} MB/s", r / MIB as f64),
+    );
 
     if !tty {
         println!(
@@ -351,35 +365,35 @@ async fn fill(low: u64, high: u64, dir_name: &str, overwrite: bool) -> Result<()
         dir_name,
         Some(&cancel),
         |event| match event {
-        Event::Started { free, aim, total } => println!(
-            "starting at {} free, steering to {} — {} to write",
-            human_bytes(free),
-            human_bytes(aim),
-            human_bytes(total)
-        ),
-        Event::Progress(p) => {
-            render_progress(&p, tty);
-            drew_bar = true;
-        }
-        Event::Wrote { name, bytes, free } => {
-            // Close the bar's line before printing, or the two overwrite each other.
-            if drew_bar && tty {
-                eprintln!();
-                drew_bar = false;
+            Event::Started { free, aim, total } => println!(
+                "starting at {} free, steering to {} — {} to write",
+                human_bytes(free),
+                human_bytes(aim),
+                human_bytes(total)
+            ),
+            Event::Progress(p) => {
+                render_progress(&p, tty);
+                drew_bar = true;
             }
-            println!(
-                "  wrote {name} ({}) -> {} free",
-                human_bytes(bytes),
-                human_bytes(free)
-            );
-        }
-        Event::Finished { free } => {
-            if drew_bar && tty {
-                eprintln!();
-                drew_bar = false;
+            Event::Wrote { name, bytes, free } => {
+                // Close the bar's line before printing, or the two overwrite each other.
+                if drew_bar && tty {
+                    eprintln!();
+                    drew_bar = false;
+                }
+                println!(
+                    "  wrote {name} ({}) -> {} free",
+                    human_bytes(bytes),
+                    human_bytes(free)
+                );
             }
-            println!("finished at {} free", human_bytes(free));
-        }
+            Event::Finished { free } => {
+                if drew_bar && tty {
+                    eprintln!();
+                    drew_bar = false;
+                }
+                println!("finished at {} free", human_bytes(free));
+            }
             Event::Deleted { .. } => {}
         },
     )
@@ -423,7 +437,12 @@ async fn clean(dir_name: &str) -> Result<()> {
     if report.removed == 0 {
         println!("nothing to remove in {dir_name}");
         for f in engine::find_filler_folders(&storage).await? {
-            println!("  filler is in {}: {} in {} file(s)", f.name, human_bytes(f.bytes), f.files);
+            println!(
+                "  filler is in {}: {} in {} file(s)",
+                f.name,
+                human_bytes(f.bytes),
+                f.files
+            );
         }
     }
     println!(

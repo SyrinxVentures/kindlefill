@@ -11,9 +11,10 @@
 // Release builds must not pop a console window behind the app on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use kindlefill_core::{engine, human_bytes, human_eta, is_disconnected,
-                      is_exclusive_access, is_permission_denied, is_timeout, ptpcamerad,
-                      Event, Window};
+use kindlefill_core::{
+    engine, human_bytes, human_eta, is_disconnected, is_exclusive_access, is_permission_denied,
+    is_timeout, ptpcamerad, Event, Window,
+};
 use mtp_rs::{CancelToken, MtpDevice, Storage};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -440,11 +441,9 @@ async fn delete_updates(
     let mut session = open_device().await?;
     let storage = &mut session.storage;
     let handle = app.clone();
-    let removed = engine::delete_staged_updates(storage, &names, move |ev| {
-        forward(&handle, ev)
-    })
-    .await
-    .map_err(|e| explain(&e))?;
+    let removed = engine::delete_staged_updates(storage, &names, move |ev| forward(&handle, ev))
+        .await
+        .map_err(|e| explain(&e))?;
 
     if removed.is_empty() {
         return Ok("Nothing was deleted — no staged update matched.".to_string());
@@ -500,11 +499,10 @@ async fn start_fill(
     }
 
     let handle = app.clone();
-    let outcome =
-        engine::fill_with_cancel(storage, window, &dir_name, Some(&token), move |ev| {
-            forward(&handle, ev)
-        })
-        .await;
+    let outcome = engine::fill_with_cancel(storage, window, &dir_name, Some(&token), move |ev| {
+        forward(&handle, ev)
+    })
+    .await;
 
     // Ours and only ours. Clearing whatever happens to be in the slot is how one
     // command takes away another's Stop button.
@@ -569,7 +567,10 @@ async fn start_clean(
             human_bytes(f.bytes),
             f.name
         )),
-        None => Ok(format!("No filler to remove — {} free.", human_bytes(report.free))),
+        None => Ok(format!(
+            "No filler to remove — {} free.",
+            human_bytes(report.free)
+        )),
     }
 }
 

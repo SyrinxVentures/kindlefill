@@ -87,6 +87,11 @@
   /* `min-height: 0` is load-bearing: without it a flex item refuses to shrink below
      its content, and the log's own scroll area would push the page tall again. */
   .block.grow { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+  /* The device panel gives way before the action row does. With every callout showing
+     there is genuinely more content than a 640px window holds, and the one thing that
+     must never be pushed off the bottom is the button you opened the app to press — so
+     this panel scrolls inside itself and Fill, Stop and the progress row stay put. */
+  .block--device { flex: 0 1 auto; min-height: 96px; overflow-y: auto; }
   /* The titlebar already says KindleFill; repeating it costs 40px and says nothing. */
   .sr-only {
     position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
@@ -261,7 +266,7 @@
 <body>
   <h1 class="sr-only">KindleFill</h1>
 
-  <section class="block" aria-label="Device">
+  <section class="block block--device" aria-label="Device">
     <div class="status"><span class="dot" id="dot"></span><span id="devline">Looking for a Kindle…</span></div>
     <div class="note" id="devhint"></div>
     <div id="devinfo" class="hidden">
@@ -641,15 +646,14 @@ function renderDevice(d) {
   // deciding whether two numbers in megabytes are the right two numbers. It goes away
   // once there is filler, because by then the question has been answered.
   //
-  // Also withheld while a callout is up. Those are specific and actionable and this is
-  // general; stacking the two pushes the buttons off the bottom of a small window, and
-  // between "what is this app for" and "there is a firmware update sitting on your
-  // device", the second one is what the moment is about.
-  const quiet = d.foreign.length === 0 && d.updates.length === 0
-    && (!d.elsewhere || d.elsewhere.length === 0) && d.writable;
-  setHint(d.filler_files === 0 && quiet
-    ? 'Filling the storage leaves too little room for the Kindle to download a firmware '
-      + 'update. Turn on Airplane Mode as well — this stops the download, not the check.'
+  // Shown whenever there is nothing of ours on the device, callouts or not. It costs
+  // real height in the crowded state, which is paid for by the device panel scrolling
+  // inside itself rather than pushing the buttons off the bottom of the window.
+  setHint(d.filler_files === 0
+    ? 'KindleFill is a tool to fill empty space on a Kindle which then blocks automatic '
+      + 'Amazon firmware updates. It is also recommended to turn Airplane Mode on to stop '
+      + 'additional checks and download attempts. If a previously downloaded firmware '
+      + 'upgrade is detected, KindleFill will offer you the option to delete it.'
     : '');
   $('devinfo').classList.remove('hidden');
   $('d-storage').textContent = d.storage;

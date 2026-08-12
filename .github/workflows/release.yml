@@ -81,6 +81,39 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: cargo tauri build
 
+      # `bundle_dmg.sh` sets the window size, background and icon positions by driving
+      # Finder over AppleScript, and a CI runner has no Finder session — so it skips all
+      # of it and ships a DMG carrying the background image and volume icon but nothing
+      # telling Finder to use them. It opens as a plain file list.
+      #
+      # `.DS_Store` is that missing instruction, captured from a local build where
+      # Finder does exist. Safe to inject after notarization: the ticket is stapled to
+      # the .app inside, and this only rewrites the container around it.
+      - name: Give the DMG its Finder layout
+        run: |
+          DMG=$(ls target/release/bundle/dmg/*.dmg)
+          hdiutil convert "$DMG" -format UDRW -o /tmp/rw.dmg
+          MP=$(hdiutil attach /tmp/rw.dmg -nobrowse -noverify | grep -o '/Volumes/.*' | head -1)
+          cp crates/kindlefill-app/dmg/DS_Store "$MP/.DS_Store"
+          # The volume only draws .VolumeIcon.icns when flagged as having a custom icon.
+          SetFile -a C "$MP" 2>/dev/null || true
+          hdiutil detach "$MP" -quiet
+          rm -f "$DMG"
+          hdiutil convert /tmp/rw.dmg -format UDZO -imagekey zlib-level=9 -o "$DMG"
+          rm -f /tmp/rw.dmg
+          echo "Injected layout into $(basename "$DMG")"
+
+      # Proves the injection worked rather than assuming it — a missing .DS_Store means
+      # the DMG opens as a plain list again, which is the defect this step exists for.
+      - name: Verify the layout survived
+        run: |
+          DMG=$(ls target/release/bundle/dmg/*.dmg)
+          MP=$(hdiutil attach "$DMG" -nobrowse -readonly | grep -o '/Volumes/.*' | head -1)
+          for f in .DS_Store .VolumeIcon.icns .background/background.png; do
+            if [ -e "$MP/$f" ]; then echo "  present: $f"; else echo "::error::missing $f"; hdiutil detach "$MP" -quiet; exit 1; fi
+          done
+          hdiutil detach "$MP" -quiet
+
       # Asked of the artifact rather than assumed from the secrets being set: signing can
       # succeed and notarization still fail, and a release that claims to open cleanly
       # when it doesn't is worse than one that admits it.

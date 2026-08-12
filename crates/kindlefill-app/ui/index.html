@@ -621,7 +621,11 @@ $('fill').onclick = async () => {
   $('bar').setAttribute('aria-valuenow', '0');
   try {
     log(await invoke('start_fill', {
-      low, high, dirName: dirName(), overwrite: $('overwrite').checked,
+      low, high, dirName: dirName(),
+      // The token identifying the exact foreign listing shown above the tick, not a
+      // bare true. The backend re-derives it from the device and refuses if the folder
+      // has changed, so a confirmation can't be spent on contents nobody was shown.
+      overwrite: $('overwrite').checked ? device.overwrite_token : null,
     }));
   } catch (e) {
     log('Error: ' + String(e));

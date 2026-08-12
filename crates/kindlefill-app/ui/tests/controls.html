@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>KindleFill — control-state tests</title>
+<style>
+  body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         margin: 24px; color: #16171a; background: #fff; }
+  h1 { font-size: 17px; margin: 0 0 4px; }
+  p.lede { color: #5c626b; margin: 0 0 18px; max-width: 62ch; }
+  #out { border-collapse: collapse; width: 100%; max-width: 900px; }
+  #out td { border-top: 1px solid #dfe1e5; padding: 7px 8px; vertical-align: top; }
+  .pass { color: #1a7f4b; font-weight: 600; white-space: nowrap; }
+  .fail { color: #b3261e; font-weight: 600; white-space: nowrap; }
+  .why  { color: #b3261e; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+  #tally { margin-top: 16px; font-weight: 600; }
+  iframe { display: none; }
+</style>
+</head>
+<body>
+<h1>Control-state tests</h1>
+<p class="lede">
+  Runs against the real <code>../index.html</code> — not a copy, which would drift — with
+  the Tauri bridge stubbed. Serve this directory and open the page:
+  <code>cd crates/kindlefill-app/ui &amp;&amp; python3 -m http.server 8000</code>, then
+  <code>localhost:8000/tests/controls.html</code>. It needs a server because the page
+  fetches the app's own HTML, which <code>file://</code> forbids.
+</p>
+<table id="out"></table>
+<div id="tally">running…</div>
+
+<script type="module">
+// A complete DeviceSnapshot. Completeness is load-bearing: renderDevice reads
+// `d.updates.length` and `d.foreign.length` unguarded, so a missing field throws,
+// lands in refresh()'s catch, and disables #fill — which is the same value a passing
+// test expects. Every case therefore also asserts the device rendered at all.
+const SNAPSHOT = {
+  model: 'Kindle', storage: 'Internal Storage',
+  total: 31000000000, free: 8000000000,
+  total_human: '28.87 GB', free_human: '7.45 GB',
+  writable: true,
+  fill_dir: 'fill_disk', fill_dir_exists: true,
+  filler_files: 2, filler_bytes: 8192, filler_human: '8.00 KB',
+  foreign: [], overwrite_token: null, updates: [], elsewhere: [],
+};
+
+const FOREIGN = [{ name: 'mybook.azw3', bytes: 4096, human: '4.00 KB' }];
+const UPDATE = [{ name: 'update_kindle.bin', bytes: 1048576, human: '1.00 MB' }];
+
+/// Boot the app in an iframe with `overrides` applied to the snapshot `detect` returns.
+/// `hang` names commands whose promise never settles, which is how an operation is held
+/// open long enough to inspect the controls mid-flight.
+async function boot(overrides, hang = []) {
+  // `no-store`, or the browser serves the copy it already had and the suite silently
+  // tests the last version of the app rather than this one — which is a test suite
+  // that cannot go red, the worst kind.
+  const source = await (await fetch('../index.html', { cache: 'no-store' })).text();
+  const config = JSON.stringify({ snapshot: { ...SNAPSHOT, ...overrides }, hang });
+  const stub = `<script>
+    const CONFIG = ${config};
+    window.__H__ = { calls: {}, args: {} };
+    window.__TAURI__ = {
+      core: {
+        invoke: (cmd, args) => {
+          window.__H__.calls[cmd] = (window.__H__.calls[cmd] || 0) + 1;
+          window.__H__.args[cmd] = args;
+          if (CONFIG.hang.includes(cmd)) return new Promise(() => {});
+          if (cmd === 'detect') return Promise.resolve(CONFIG.snapshot);
+          if (cmd === 'device_present') return Promise.resolve(true);
+          return Promise.resolve('ok');
+        },
+      },
+      event: { listen: () => Promise.resolve(() => {}) },
+    };
+  <\/script>`;
+
+  const frame = document.createElement('iframe');
+  frame.srcdoc = source.replace('</head>', stub + '</head>');
+  document.body.appendChild(frame);
+  await new Promise((r) => frame.addEventListener('load', r, { once: true }));
+
+  const win = frame.contentWindow;
+  const g = (id) => win.document.getElementById(id);
+  // The first detect is async, so wait for it rather than guessing a delay.
+  await until(() => win.__H__.calls.detect >= 1 && g('devline').textContent !== 'Looking for a Kindle…');
+  return {
+    win,
+    g,
+    calls: () => win.__H__.calls,
+    args: () => win.__H__.args,
+    tick: () => sleep(60),
+  };
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(predicate, timeout = 3000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await sleep(15);
+  }
+  throw new Error('timed out waiting for the app to settle');
+}
+
+function is(actual, expected, what) {
+  if (actual !== expected) throw new Error(`${what}: expected ${expected}, got ${actual}`);
+}
+
+const CASES = [];
+const test = (name, fn) => CASES.push({ name, fn });
+
+// ---------------------------------------------------------------------------
+// The wave-1 regression. #overwrite sits inside a callout that stays visible for the
+// whole fill, and its handler used to recompute Fill's state without consulting
+// `busy` — so reticking it mid-fill made Fill clickable and a second click opened a
+// device the first fill still held.
+// ---------------------------------------------------------------------------
+test('Fill stays disabled during a fill, including after re-ticking Overwrite', async () => {
+  const t = await boot({ foreign: FOREIGN, overwrite_token: 'tok' }, ['start_fill']);
+  is(t.g('devline').textContent, 'Kindle connected', 'the device must have rendered');
+
+  t.g('overwrite').click();
+  is(t.g('fill').disabled, false, '#fill after confirming the foreign content');
+  t.g('fill').click();
+  await t.tick();
+
+  is(t.g('fill').disabled, true, '#fill during the fill');
+  is(t.g('overwrite').disabled, true, '#overwrite during the fill');
+  is(t.g('stop').disabled, false, '#stop during the fill');
+
+  t.g('overwrite').click();
+  t.g('overwrite').click();
+  await t.tick();
+  is(t.g('fill').disabled, true, '#fill after re-ticking Overwrite mid-fill');
+
+  t.g('fill').click();
+  await t.tick();
+  is(t.calls().start_fill, 1, 'start_fill invocations');
+});
+
+// ---------------------------------------------------------------------------
+// setBusy(false) used to re-enable from a rule that had never heard of `writable`,
+// so an operation ending on read-only storage handed back a live Fill button.
+// ---------------------------------------------------------------------------
+test('Fill stays disabled on read-only storage after an operation ends', async () => {
+  const t = await boot({ writable: false, updates: UPDATE });
+  is(t.g('devline').textContent, 'Kindle connected (storage is read-only)', 'header');
+  is(t.g('fill').disabled, true, '#fill on read-only storage');
+
+  // A real busy cycle that runs to completion: arm, confirm, let it finish.
+  t.g('delupdates').click();
+  t.g('delupdates').click();
+  await until(() => t.calls().delete_updates >= 1 && t.g('refresh').disabled === false);
+
+  is(t.g('fill').disabled, true, '#fill once the operation has finished');
+});
+
+// ---------------------------------------------------------------------------
+// Same split for Clean: setBusy said `on || !device` while renderDevice said
+// `filler_files === 0`, which is why Clean flickered enabled after every operation.
+// ---------------------------------------------------------------------------
+test('Clean stays disabled with no filler after an operation ends', async () => {
+  const t = await boot({ filler_files: 0, filler_bytes: 0, filler_human: '0 B', updates: UPDATE });
+  is(t.g('clean').disabled, true, '#clean with no filler present');
+
+  t.g('delupdates').click();
+  t.g('delupdates').click();
+  await until(() => t.calls().delete_updates >= 1 && t.g('refresh').disabled === false);
+
+  is(t.g('clean').disabled, true, '#clean once the operation has finished');
+});
+
+// ---------------------------------------------------------------------------
+// The confirmation is a token identifying the listing the user saw, not a bare true.
+// ---------------------------------------------------------------------------
+test('Overwrite sends the token for the listing it was shown, not a bare flag', async () => {
+  const t = await boot({ foreign: FOREIGN, overwrite_token: 'tok-abc' }, ['start_fill']);
+  is(t.g('overwrite').checked, false, 'a fresh listing is a fresh decision');
+  is(t.g('fill').disabled, true, '#fill is held until the foreign content is confirmed');
+
+  t.g('overwrite').click();
+  t.g('fill').click();
+  await t.tick();
+  is(t.args().start_fill.overwrite, 'tok-abc', 'the confirmation sent with the fill');
+});
+
+test('An unconfirmed fill sends no token at all', async () => {
+  const t = await boot({}, ['start_fill']);
+  t.g('fill').click();
+  await t.tick();
+  is(t.args().start_fill.overwrite, null, 'nothing was confirmed, so nothing is claimed');
+});
+
+// ---------------------------------------------------------------------------
+// The log placeholder is a :empty rule, and log() appends a child node.
+// ---------------------------------------------------------------------------
+test('The log placeholder disappears on the first line', async () => {
+  const t = await boot({}, ['start_fill']);
+  const log = t.g('log');
+  is(log.childNodes.length, 0, 'the log starts empty so :empty shows the placeholder');
+  t.g('fill').click();
+  t.g('stop').click();
+  await t.tick();
+  if (log.childNodes.length === 0) throw new Error('the log never received a node');
+  if (!log.textContent.includes('Stopping')) throw new Error(`unexpected log: ${log.textContent}`);
+});
+
+const out = document.getElementById('out');
+let passed = 0;
+for (const c of CASES) {
+  const row = out.insertRow();
+  try {
+    await c.fn();
+    row.insertCell().outerHTML = '<td class="pass">PASS</td>';
+    row.insertCell().textContent = c.name;
+    passed++;
+  } catch (e) {
+    row.insertCell().outerHTML = '<td class="fail">FAIL</td>';
+    const cell = row.insertCell();
+    cell.textContent = c.name;
+    const why = document.createElement('div');
+    why.className = 'why';
+    why.textContent = String(e && e.message ? e.message : e);
+    cell.appendChild(why);
+  }
+}
+const tally = document.getElementById('tally');
+tally.textContent = `${passed} of ${CASES.length} passed`;
+tally.className = passed === CASES.length ? 'pass' : 'fail';
+</script>
+</body>
+</html>

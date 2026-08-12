@@ -112,6 +112,11 @@ struct DeviceSnapshot {
     /// alone, so their presence means the folder will survive removal — and it may
     /// mean the folder belongs to something else entirely.
     foreign: Vec<NamedObject>,
+    /// Identifies the `foreign` set above. The webview hands this back with a fill
+    /// that asks to overwrite, and the backend refuses if the folder no longer matches
+    /// — which is what ties the tick the user gave to the files they were shown.
+    /// `None` when nothing foreign is there and no confirmation is needed.
+    overwrite_token: Option<String>,
     /// Staged OTA firmware images at the storage root.
     updates: Vec<NamedObject>,
     /// Filler found under a *different* folder name. Nothing persists the name
@@ -357,7 +362,7 @@ async fn detect(state: State<'_, AppState>, dir_name: String) -> Result<DeviceSn
     storage.refresh().await.map_err(|e| explain(&e))?;
 
     let (mut filler_files, mut filler_bytes) = (0usize, 0u64);
-    let mut foreign = Vec::new();
+    let mut found_foreign = Vec::new();
     let existing = engine::find_fill_dir(storage, &dir_name)
         .await
         .map_err(|e| explain(&e))?;
@@ -367,13 +372,14 @@ async fn detect(state: State<'_, AppState>, dir_name: String) -> Result<DeviceSn
             .map_err(|e| explain(&e))?;
         filler_files = fillers.len();
         filler_bytes = fillers.iter().map(|f| f.size).sum();
-        foreign = engine::list_foreign(storage, dir.handle)
+        found_foreign = engine::list_foreign(storage, dir.handle)
             .await
-            .map_err(|e| explain(&e))?
-            .iter()
-            .map(NamedObject::from)
-            .collect();
+            .map_err(|e| explain(&e))?;
     }
+    // Computed from the listing the UI is about to display, so the token stands for
+    // exactly the set of names the user will see before they tick Overwrite.
+    let overwrite_token = engine::overwrite_token(&dir_name, &found_foreign);
+    let foreign: Vec<NamedObject> = found_foreign.iter().map(NamedObject::from).collect();
 
     // Only go looking when it isn't where we expected: scanning every root folder
     // costs a listing each, and on a device with a large documents folder that is not
@@ -417,6 +423,7 @@ async fn detect(state: State<'_, AppState>, dir_name: String) -> Result<DeviceSn
         filler_bytes,
         filler_human: human_bytes(filler_bytes),
         foreign,
+        overwrite_token,
         updates,
         elsewhere,
     })
@@ -457,6 +464,11 @@ async fn delete_updates(
     ))
 }
 
+/// Fill to the window, optionally taking the folder over first.
+///
+/// `overwrite` is the token from the [`DeviceSnapshot`] whose foreign listing the user
+/// confirmed, or `None` to leave the folder alone. Deliberately not a `bool`: a flag
+/// says the user agreed to *something*, a token says to what.
 #[tauri::command]
 async fn start_fill(
     app: AppHandle,
@@ -464,7 +476,7 @@ async fn start_fill(
     low: u64,
     high: u64,
     dir_name: String,
-    overwrite: bool,
+    overwrite: Option<String>,
 ) -> Result<String, String> {
     let _op = claim(&state)?;
     let window = Window::new(low, high).map_err(|e| e.to_string())?;
@@ -487,11 +499,19 @@ async fn start_fill(
     // Taking the folder over is a separate, explicit act that happens before any
     // filling — so if it fails, nothing has been written yet, and if the caller didn't
     // ask for it, the destructive path isn't reached at all.
-    if overwrite {
+    //
+    // The confirmation arrives as the token `detect` computed over the very files the
+    // user was shown, not as a bare `true`, and the engine re-derives it from the
+    // device before deleting anything. A tick given for one folder therefore cannot be
+    // spent on another's contents, and it can't be spent at all on a folder that has
+    // changed since it was listed.
+    if let Some(confirmed) = &overwrite {
         let handle = app.clone();
-        let removed = engine::purge_fill_dir(storage, &dir_name, move |ev| forward(&handle, ev))
-            .await
-            .map_err(|e| explain_fill(&e))?;
+        let removed = engine::purge_fill_dir_confirmed(storage, &dir_name, confirmed, move |ev| {
+            forward(&handle, ev)
+        })
+        .await
+        .map_err(|e| explain_fill(&e))?;
         log(
             &app,
             format!("Emptied {dir_name} — {removed} item(s) deleted."),

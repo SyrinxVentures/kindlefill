@@ -134,6 +134,10 @@ pub enum FillError {
     },
     /// The requested filler folder name isn't usable.
     BadName(NameError),
+    /// The folder no longer holds what the caller was shown when they confirmed
+    /// emptying it. Refusing is the whole point: the alternative is deleting files
+    /// nobody was ever asked about.
+    StaleConfirmation,
     Mtp(Error),
 }
 
@@ -169,6 +173,11 @@ impl std::fmt::Display for FillError {
                 Ok(())
             }
             FillError::BadName(e) => write!(f, "{e}"),
+            FillError::StaleConfirmation => write!(
+                f,
+                "the folder's contents changed since they were confirmed — \
+                 re-check the folder and confirm again"
+            ),
             FillError::Mtp(e) => write!(f, "{e}"),
         }
     }
@@ -383,6 +392,110 @@ pub async fn list_foreign(storage: &Storage, dir: ObjectHandle) -> Result<Vec<Ob
         .into_iter()
         .filter(|o| !(o.is_file() && filler_sequence(&o.filename).is_some()))
         .collect())
+}
+
+/// A fingerprint of the content in `dir_name` that this tool didn't write.
+///
+/// `None` means there is nothing foreign in there — no confirmation is needed for that
+/// folder, and none can be given for it.
+///
+/// Pure, so the caller that has already listed the folder doesn't list it twice, and so
+/// the one that hasn't ([`current_overwrite_token`]) reaches the same answer by the same
+/// route. The folder name is folded in deliberately: a confirmation is *for a folder's
+/// contents*, and two folders that happen to hold identically-named files are still two
+/// different decisions.
+///
+/// Not a security primitive. The webview is in-process and could send any string it
+/// likes; the failure being closed off is a *stale* confirmation — one given for another
+/// folder, or for a listing taken before something else landed in it — not a forged one.
+#[must_use]
+pub fn overwrite_token(dir_name: &str, foreign: &[ObjectInfo]) -> Option<String> {
+    if foreign.is_empty() {
+        return None;
+    }
+    let mut names: Vec<(&str, u64)> = foreign
+        .iter()
+        .map(|o| (o.filename.as_str(), o.size))
+        .collect();
+    // Sorted so the token describes the set, not the order the device happened to
+    // list it in — MTP gives no ordering guarantee, and a token that changed between
+    // two identical listings would refuse every confirmation.
+    names.sort_unstable();
+
+    let mut digest = Fnv1a::new();
+    digest.write(dir_name.as_bytes());
+    for (name, size) in names {
+        digest.write(&[0]);
+        digest.write(name.as_bytes());
+        digest.write(&size.to_le_bytes());
+    }
+    Some(format!("{:016x}", digest.finish()))
+}
+
+/// [`overwrite_token`] for the folder as the device has it right now.
+pub async fn current_overwrite_token(
+    storage: &Storage,
+    dir_name: &str,
+) -> Result<Option<String>, Error> {
+    let Some(dir) = find_fill_dir(storage, dir_name).await? else {
+        return Ok(None);
+    };
+    Ok(overwrite_token(
+        dir_name,
+        &list_foreign(storage, dir.handle).await?,
+    ))
+}
+
+/// FNV-1a, written out rather than reached for.
+///
+/// The token has to mean the same thing to the `detect` that displayed a listing and
+/// the purge that acts on it. `DefaultHasher` is documented as free to change between
+/// Rust releases, which is fine for a `HashMap` and wrong for a value two calls compare
+/// for equality. Eight lines of arithmetic that can't drift is the cheaper guarantee.
+struct Fnv1a(u64);
+
+impl Fnv1a {
+    fn new() -> Self {
+        Fnv1a(0xcbf2_9ce4_8422_2325)
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = (self.0 ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Empty the folder, but only if what's in it is still what the caller was shown.
+///
+/// [`purge_fill_dir`] takes a name and empties it; the binding between "the user was
+/// shown these files" and "this folder gets emptied" lived entirely in one line of
+/// frontend JS resetting a checkbox. That line is correct and always runs — but it was
+/// the *only* thing standing between a confirmation and a recursive delete, and it
+/// lives in a state machine that has already been driven somewhere it shouldn't go.
+/// This is the same binding expressed server-side: the token is recomputed from the
+/// device as it is now, and a mismatch refuses instead of deleting. It also closes the
+/// window where something lands in the folder between the listing and the purge.
+///
+/// The CLI's `--overwrite` deliberately doesn't come through here: there the folder
+/// name and the flag are typed in one command, so the confirmation is bound to its
+/// target by construction and a token would only be ceremony.
+pub async fn purge_fill_dir_confirmed<F>(
+    storage: &mut Storage,
+    dir_name: &str,
+    confirmed: &str,
+    on_event: F,
+) -> Result<usize, FillError>
+where
+    F: FnMut(Event) + Send,
+{
+    validate_dir_name(dir_name)?;
+    if current_overwrite_token(storage, dir_name).await?.as_deref() != Some(confirmed) {
+        return Err(FillError::StaleConfirmation);
+    }
+    purge_fill_dir(storage, dir_name, on_event).await
 }
 
 /// Empty the filler folder completely, including content this tool did not write.
@@ -735,6 +848,34 @@ mod tests {
             obj("fill_.bin"),
         ];
         assert_eq!(next_sequence(&existing), 0);
+    }
+
+    /// The `fill_notes.bin` bug was two functions answering "is this ours?"
+    /// differently, and the permissive half was the half that deletes.
+    /// [`filler_sequence`] is now the single owner of that question — but the tests
+    /// below pin its *behaviour*, and behaviour tests stay green while a second site
+    /// quietly reintroduces the same divergence somewhere else in the file. This fails
+    /// the build when that happens.
+    ///
+    /// Both spellings are counted: a copy written against the string literal would slip
+    /// past a check that only knew the constant, which is the obvious way a guardrail
+    /// like this gets walked around by accident.
+    #[test]
+    fn only_one_place_decides_whether_a_name_is_filler() {
+        // Relative to the crate root, which is where cargo runs a test binary from,
+        // whether it was invoked at the workspace root or in this directory.
+        let src = std::fs::read_to_string("src/engine.rs").expect("read engine.rs");
+        // Everything above `#[cfg(test)]`, because both needles appear verbatim in the
+        // lines just below and counting those would leave this permanently red.
+        let (module, _) = src
+            .split_once("#[cfg(test)]")
+            .expect("engine.rs has a test module");
+        let sites = module.matches("strip_prefix(FILL_PREFIX)").count()
+            + module.matches(r#"strip_prefix("fill_")"#).count();
+        assert_eq!(
+            sites, 1,
+            "a second site is parsing filler names; extend filler_sequence instead"
+        );
     }
 
     /// The property that matters for `clean`: a name is ours only if we would write

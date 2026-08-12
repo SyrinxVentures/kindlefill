@@ -1,0 +1,28 @@
+name: CI
+
+# Nothing below needs a Kindle on the cable. The engine is exercised against mtp-rs's
+# virtual device, which is backed by a real directory and reports free space from real
+# bytes — so this gates the part that matters rather than the part that happens to run
+# without hardware. What it can't prove is that a real Kindle's GetStorageInfo updates
+# promptly after a write; that is what `kindlefill bench` is for.
+on: [push, pull_request]
+
+jobs:
+  check:
+    # macOS because it is the platform this is built and used on: the ptpcamerad module
+    # is macOS-only and the app links the system WebKit. Linux and Windows have never
+    # been compiled — see the Platforms section of the README.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --workspace
+      # The frontend harness in crates/kindlefill-app/ui/tests/ is deliberately not run
+      # here: it needs a browser, and adding one is a bigger dependency than the three
+      # assertions currently justify. It is a manual step, and the README says so
+      # rather than letting "CI is green" imply the frontend is covered.

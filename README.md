@@ -266,8 +266,28 @@ would pass every test here and hang on the cable. That's what `bench` is for, an
 Paperwhite Signature Edition it came back exact.
 
 ```bash
-cargo test      # 58 tests, no hardware required
+cargo test      # no hardware required
 ```
+
+CI runs `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings` and
+`cargo test --workspace` on every push and pull request. Since none of it needs a
+Kindle, it gates the part that matters rather than a subset that happens to run without
+hardware.
+
+**The frontend is not covered by CI.** The app's ~430 lines of JavaScript have a small
+harness at `crates/kindlefill-app/ui/tests/controls.html`, which loads the real
+`index.html` with the Tauri bridge stubbed and asserts what is clickable after scripted
+interactions — including the case where re-ticking Overwrite mid-fill used to make Fill
+clickable again. It runs in a browser, by hand:
+
+```bash
+cd crates/kindlefill-app/ui && python3 -m http.server 8000
+# then open http://localhost:8000/tests/controls.html
+```
+
+Wiring a headless browser into CI is a bigger dependency than six assertions currently
+justify. Until that changes, a green CI badge says nothing about the frontend, so it
+shouldn't be read as if it does.
 
 ## License
 

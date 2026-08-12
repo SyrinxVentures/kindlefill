@@ -860,3 +860,133 @@ async fn below_the_window_with_nothing_of_ours_to_remove_is_still_an_error() {
         other => panic!("expected AlreadyBelowWindow, got {other:?}"),
     }
 }
+
+/// The confirmation has to name what it confirms.
+///
+/// `purge_fill_dir` empties whatever folder its caller points at, and the only thing
+/// binding "the user was shown these files" to "this folder gets emptied" was one line
+/// of frontend JS clearing a checkbox. This is that binding server-side.
+#[tokio::test]
+async fn a_confirmation_is_refused_once_the_folder_stops_matching_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let device = open(tmp.path()).await;
+    let mut storage = storage_of(&device).await;
+
+    engine::fill(&mut storage, window(), DIR, |_| {})
+        .await
+        .expect("fill");
+    let dir = engine::find_fill_dir(&storage, DIR).await.unwrap().unwrap();
+    put(&storage, dir.handle, "mybook.azw3", 1024).await;
+
+    let confirmed = engine::current_overwrite_token(&storage, DIR)
+        .await
+        .expect("token")
+        .expect("a folder with foreign content has a token");
+
+    // Something lands in the folder between the listing and the purge — the window the
+    // client-side check could never have covered.
+    put(&storage, dir.handle, "late_arrival.azw3", 2048).await;
+
+    match engine::purge_fill_dir_confirmed(&mut storage, DIR, &confirmed, |_| {}).await {
+        Err(engine::FillError::StaleConfirmation) => {}
+        other => panic!("expected StaleConfirmation, got {other:?}"),
+    }
+    let names = child_names(&storage, dir.handle).await;
+    assert!(
+        names.contains(&"late_arrival.azw3".to_string())
+            && names.contains(&"mybook.azw3".to_string()),
+        "a refused purge must delete nothing: {names:?}"
+    );
+
+    // Re-listing is what makes it a fresh decision, and the fresh token is accepted.
+    let confirmed = engine::current_overwrite_token(&storage, DIR)
+        .await
+        .expect("token")
+        .expect("still foreign content in there");
+    engine::purge_fill_dir_confirmed(&mut storage, DIR, &confirmed, |_| {})
+        .await
+        .expect("a matching confirmation must be honoured");
+    assert!(
+        child_names(&storage, dir.handle).await.is_empty(),
+        "the folder should be empty now"
+    );
+}
+
+/// A token is for one folder's contents, not for any folder that happens to hold the
+/// same filenames — which is exactly the mistake a carried-over checkbox makes.
+#[tokio::test]
+async fn a_confirmation_for_one_folder_cannot_be_spent_on_another() {
+    let tmp = tempfile::tempdir().unwrap();
+    let device = open(tmp.path()).await;
+    let mut storage = storage_of(&device).await;
+
+    for folder in [DIR, "other_folder"] {
+        let handle = storage
+            .create_folder(Some(ObjectHandle::ROOT), folder)
+            .await
+            .expect("create folder");
+        put(&storage, handle, "mybook.azw3", 1024).await;
+    }
+
+    let for_default = engine::current_overwrite_token(&storage, DIR)
+        .await
+        .unwrap()
+        .expect("token");
+
+    match engine::purge_fill_dir_confirmed(&mut storage, "other_folder", &for_default, |_| {}).await
+    {
+        Err(engine::FillError::StaleConfirmation) => {}
+        other => panic!("expected StaleConfirmation, got {other:?}"),
+    }
+    let other = engine::find_fill_dir(&storage, "other_folder")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        child_names(&storage, other.handle).await,
+        vec!["mybook.azw3".to_string()],
+        "the other folder must be untouched"
+    );
+}
+
+/// No foreign content means no confirmation exists to give — and none is accepted.
+#[tokio::test]
+async fn a_folder_holding_only_our_own_filler_has_no_confirmation_to_give() {
+    let tmp = tempfile::tempdir().unwrap();
+    let device = open(tmp.path()).await;
+    let mut storage = storage_of(&device).await;
+
+    engine::fill(&mut storage, window(), DIR, |_| {})
+        .await
+        .expect("fill");
+
+    assert_eq!(
+        engine::current_overwrite_token(&storage, DIR)
+            .await
+            .unwrap(),
+        None,
+        "nothing in there is anyone else's"
+    );
+    assert_eq!(
+        engine::current_overwrite_token(&storage, "no_such_folder")
+            .await
+            .unwrap(),
+        None
+    );
+    match engine::purge_fill_dir_confirmed(&mut storage, DIR, "any-token-at-all", |_| {}).await {
+        Err(engine::FillError::StaleConfirmation) => {}
+        other => panic!("expected StaleConfirmation, got {other:?}"),
+    }
+}
+
+async fn child_names(storage: &Storage, dir: ObjectHandle) -> Vec<String> {
+    let mut names: Vec<String> = storage
+        .list_objects(Some(dir))
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|o| o.filename)
+        .collect();
+    names.sort();
+    names
+}

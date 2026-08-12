@@ -161,9 +161,41 @@ struct AppState {
 Take the guard at the top of `start_fill`, `start_clean`, `delete_updates` and `detect`,
 returning a clear `Err("Another operation is already running.".into())` rather than
 racing. Release it on **every** exit path — an RAII guard struct with a `Drop` impl is the
-way to do that without repeating the release before each `?`. (Note: `MutexGuard` cannot
-be held across an `await` in a Tauri command — the future must stay `Send`. Set a flag,
-drop the lock, and clear it in `Drop`.)
+way to do that without repeating the release before each `?`.
+
+**The claim and the take must be one atomic operation.** A plain `Mutex<bool>` that you
+read, drop, then set is a test-and-set race: two commands can both observe `false` before
+either writes `true`, and an RAII `Drop` doesn't fix that — it's the *acquire* that has to
+be indivisible. This matters because a `std::sync::MutexGuard` cannot be held across an
+`await` in a Tauri command (the future must stay `Send`, which is why the existing code at
+`main.rs:429-433` scopes its guard with a comment saying so).
+
+Two shapes that are actually correct — pick either:
+
+```rust
+// (a) AtomicBool, claimed in one indivisible step.
+struct OpGuard<'a>(&'a AtomicBool);
+impl Drop for OpGuard<'_> {
+    fn drop(&mut self) { self.0.store(false, Ordering::Release); }
+}
+fn claim(flag: &AtomicBool) -> Option<OpGuard<'_>> {
+    flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .ok()
+        .map(|_| OpGuard(flag))
+}
+```
+
+```rust
+// (b) tokio::sync::Mutex — its OwnedMutexGuard IS Send, so it can be held across the
+// awaits that make up the operation. `try_lock_owned()` claims-or-fails atomically.
+let _op = state.busy.clone().try_lock_owned()
+    .map_err(|_| "Another operation is already running.".to_string())?;
+```
+
+(b) is fewer moving parts if you're willing to add `tokio` to the app crate's dependencies
+— it's already a workspace dependency, so this is a manifest line, not a new package.
+(a) keeps the dependency set unchanged. Do **not** hand-roll the flag pattern in prose
+form; the race it introduces is the bug this wave is closing.
 
 ### 3. Backend — stop clobbering the cancel token
 

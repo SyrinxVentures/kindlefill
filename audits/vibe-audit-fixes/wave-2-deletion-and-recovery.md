@@ -93,17 +93,43 @@ True on the happy path, false exactly where it matters.
 2. Handle `e.partial` the way `fill_with_cancel` does — delete the partial object before
    propagating.
 
-3. If cleanup itself fails, **print the exact recovery command** rather than leaving the
-   user to guess:
+3. If cleanup itself fails, print a recovery instruction that actually works — and note
+   that **right now there isn't one**. Check the CLI surface before writing the message:
+
+   - `clean --dir kindlefill_bench` deletes only `fill_NNNN.bin` names, so it leaves
+     `bench_512MiB.bin` exactly where it is.
+   - `fill --dir kindlefill_bench --overwrite` *would* empty the folder — and then fill
+     the device to the target window, which is emphatically not what someone recovering
+     from a failed benchmark wants.
+
+   So `purge_fill_dir` exists in the engine but no CLI verb reaches it standalone. The
+   right fix is to expose one:
+
+   ```rust
+   /// Empty a folder at the storage root, including files this tool didn't write.
+   /// Separate from `clean`, which only removes filler it can prove it wrote — this is
+   /// the deliberate, named way to take a folder back, and the recovery path when
+   /// `bench` fails to tidy up after itself.
+   Purge {
+       #[arg(long)]
+       dir: String,
+   },
+   ```
+
+   wired straight to `engine::purge_fill_dir`. Then the message can name something real:
 
    ```
    !! could not remove kindlefill_bench — up to 656 MB is still on the device.
-      Remove it with:  kindlefill fill --dir kindlefill_bench --overwrite
+      Remove it with:  kindlefill purge --dir kindlefill_bench
    ```
 
-   (Check that invocation actually empties the folder before shipping the message. If
-   `fill --overwrite` isn't the right recovery verb, add whatever is — but the message
-   must name a command that works.)
+   Adding `purge` widens the CLI's destructive surface, so gate it the way the rest of
+   the crate gates deletion: it takes an explicit `--dir`, has no default, and prints what
+   it removed. Document it in the README's CLI section alongside the existing warning that
+   `--overwrite` is the only other thing that deletes files this tool didn't write. If you
+   would rather not add the verb, the alternative is a message telling the user to delete
+   the folder with a file manager or Calibre — but do **not** ship a message naming a
+   command that doesn't do what it says.
 
 4. Soften `README.md:173` to something true on both paths — e.g. "cleans up after itself,
    and tells you exactly what to remove if it can't."

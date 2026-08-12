@@ -152,7 +152,10 @@ and the suite stays green. Add a grep-based guardrail:
 #[test]
 fn only_one_place_decides_whether_a_name_is_filler() {
     let src = std::fs::read_to_string("src/engine.rs").unwrap();
-    let sites = src.matches("strip_prefix(FILL_PREFIX)").count();
+    // Both spellings: a copy written against the literal slips past a check that only
+    // knows the constant, which is the obvious way this guardrail gets bypassed.
+    let sites = src.matches("strip_prefix(FILL_PREFIX)").count()
+              + src.matches(r#"strip_prefix("fill_")"#).count();
     assert_eq!(sites, 1, "a second site is parsing filler names; extend filler_sequence instead");
 }
 ```

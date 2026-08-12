@@ -394,7 +394,15 @@ async fn refuses_to_fill_a_device_already_below_the_window() {
         .expect("upload bulk");
 
     match engine::fill(&mut storage, window(), DIR, |_| {}).await {
-        Err(engine::FillError::AlreadyBelowWindow { .. }) => {}
+        // Empty `elsewhere` is the load-bearing half: it is what distinguishes "the
+        // space isn't ours" from "your filler is under another name", which the
+        // sibling test below covers.
+        Err(engine::FillError::AlreadyBelowWindow { elsewhere, .. }) => {
+            assert!(
+                elsewhere.is_empty(),
+                "none of this space is ours: {elsewhere:?}"
+            );
+        }
         other => panic!("expected AlreadyBelowWindow, got {other:?}"),
     }
     assert!(
@@ -404,6 +412,43 @@ async fn refuses_to_fill_a_device_already_below_the_window() {
             .is_none(),
         "must not leave an empty fill_disk behind after refusing"
     );
+}
+
+/// Refusing is right; refusing *silently* is not. Nothing remembers the folder name
+/// between launches, so the default is exactly what a relaunched app asks about while
+/// the filler sits under the name the user picked — and "nothing to fill" would leave
+/// them believing the space was never ours to return.
+#[tokio::test]
+async fn refusing_below_the_window_says_where_the_filler_actually_is() {
+    let tmp = tempfile::tempdir().unwrap();
+    let device = open(tmp.path()).await;
+    let mut storage = storage_of(&device).await;
+
+    engine::fill(&mut storage, window(), "somewhere_else", |_| {})
+        .await
+        .expect("fill");
+
+    // A window above where the fill just left free space, asked about the *default*
+    // folder — the shape of a relaunch that has forgotten the chosen name.
+    let higher = Window::new(20 * MIB, 30 * MIB).unwrap();
+    match engine::fill(&mut storage, higher, DIR, |_| {}).await {
+        Err(e @ engine::FillError::AlreadyBelowWindow { .. }) => {
+            let engine::FillError::AlreadyBelowWindow { ref elsewhere, .. } = e else {
+                unreachable!()
+            };
+            assert_eq!(elsewhere.len(), 1, "{elsewhere:?}");
+            assert_eq!(elsewhere[0].name, "somewhere_else");
+            assert!(elsewhere[0].bytes > 0);
+            // Both front ends render this error through `Display`, so the folder has
+            // to survive the trip into the string — not just sit on the struct.
+            let shown = e.to_string();
+            assert!(
+                shown.contains("somewhere_else"),
+                "the message has to name the folder: {shown}"
+            );
+        }
+        other => panic!("expected AlreadyBelowWindow, got {other:?}"),
+    }
 }
 
 async fn put(storage: &Storage, parent: ObjectHandle, name: &str, size: u64) {

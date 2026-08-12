@@ -10,6 +10,13 @@ description = "Diagnostics and command-line driver for kindlefill."
 name = "kindlefill"
 path = "src/main.rs"
 
+[dev-dependencies]
+# The virtual device, so `bench`'s cleanup-on-failure can be proven without a Kindle
+# on the cable. Test-only: the shipped binary's dependency set is unchanged.
+mtp-rs = { workspace = true, features = ["virtual-device"] }
+tokio = { workspace = true }
+tempfile = "3"
+
 [dependencies]
 kindlefill-core = { path = "../kindlefill-core" }
 mtp-rs = { workspace = true }

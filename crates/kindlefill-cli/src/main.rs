@@ -26,7 +26,8 @@ struct Cli {
 enum Command {
     /// Enumerate devices and report what we can see. Changes nothing.
     Probe,
-    /// Measure write throughput and verify free space tracks writes. Cleans up after itself.
+    /// Measure write throughput and verify free space tracks writes. Cleans up after
+    /// itself — and if it cannot, says exactly what to remove.
     Bench,
     /// Show current free space, any existing filler, and any staged firmware update.
     Status {
@@ -50,6 +51,20 @@ enum Command {
     /// Delete all filler this tool wrote.
     Clean {
         #[arg(long, default_value = engine::DEFAULT_FILL_DIR)]
+        dir: String,
+    },
+    /// Empty a folder at the storage root, including files this tool didn't write.
+    ///
+    /// Separate from `clean`, which removes only filler it can prove it wrote. This is
+    /// the deliberate, named way to take a folder back — and the recovery path when
+    /// `bench` fails to tidy up after itself, whose `bench_*.bin` objects `clean`
+    /// cannot match and `find_filler_folders` cannot see.
+    ///
+    /// `--dir` has no default on purpose: this is the one verb that deletes content
+    /// the tool didn't write, and it should never be something a bare command run from
+    /// muscle memory can do.
+    Purge {
+        #[arg(long)]
         dir: String,
     },
 }
@@ -85,6 +100,7 @@ async fn main() -> Result<()> {
             overwrite,
         } => fill(low, high, &dir, overwrite).await,
         Command::Clean { dir } => clean(&dir).await,
+        Command::Purge { dir } => purge(&dir).await,
     }
 }
 
@@ -178,16 +194,59 @@ async fn bench() -> Result<()> {
     println!("baseline free: {}", human_bytes(baseline));
 
     let dir = storage
-        .create_folder(Some(ObjectHandle::ROOT), "kindlefill_bench")
+        .create_folder(Some(ObjectHandle::ROOT), BENCH_DIR)
         .await
         .context("could not create a folder at the storage root")?;
 
+    // Split so cleanup is reached on *every* exit, not only the happy one. Every step
+    // of the measurement used to be a `?` straight out of the function, so a failure
+    // at the 512 MiB upload — the longest, and therefore the likeliest — left up to
+    // 656 MiB committed with the folder still there. Nothing in this tool could then
+    // remove it: `clean` matches only `fill_NNNN.bin`, and `find_filler_folders` only
+    // reports folders holding names `clean` recognises, so `kindlefill_bench` was
+    // invisible to discovery as well.
     let mut written = Vec::new();
-    for (label, size) in [
-        ("16MiB", 16 * MIB),
-        ("128MiB", 128 * MIB),
-        ("512MiB", 512 * MIB),
-    ] {
+    let measured = bench_uploads(&mut storage, dir, &mut written).await;
+    let cleaned = bench_cleanup(&mut storage, dir, &written).await;
+
+    // The measurement failure is the cause; a cleanup failure on top of it is a
+    // consequence, so the cause is reported first.
+    measured?;
+    if let Err(e) = cleaned {
+        let stranded: u64 = BENCH_SIZES.iter().map(|(_, size)| size).sum();
+        eprintln!();
+        eprintln!(
+            "!! could not remove {BENCH_DIR} — up to {} is still on the device.",
+            human_bytes(stranded)
+        );
+        eprintln!("   Empty it with:  kindlefill purge --dir {BENCH_DIR}");
+        return Err(e);
+    }
+    storage.refresh().await?;
+    println!("free now {}", human_bytes(storage.info().free_space));
+    Ok(())
+}
+
+/// The folder `bench` writes into, and the sizes it writes.
+///
+/// Constants because the recovery message has to name exactly what to remove, and a
+/// name that drifts out of step with the message is worse than no message at all.
+const BENCH_DIR: &str = "kindlefill_bench";
+const BENCH_SIZES: [(&str, u64); 3] = [
+    ("16MiB", 16 * MIB),
+    ("128MiB", 128 * MIB),
+    ("512MiB", 512 * MIB),
+];
+
+/// The measurement itself. Every handle it commits is pushed to `written` before
+/// anything else can fail, so the caller's cleanup sees them even when this returns
+/// an error.
+async fn bench_uploads(
+    storage: &mut Storage,
+    dir: ObjectHandle,
+    written: &mut Vec<ObjectHandle>,
+) -> Result<()> {
+    for (label, size) in BENCH_SIZES {
         let name = format!("bench_{label}.bin");
         let before = {
             storage.refresh().await?;
@@ -195,14 +254,27 @@ async fn bench() -> Result<()> {
         };
 
         let start = Instant::now();
-        let handle = storage
+        let handle = match storage
             .upload(
                 Some(dir),
                 NewObjectInfo::file(&name, size),
                 kindlefill_core::ZeroStream::new(size),
             )
             .await
-            .map_err(|e| anyhow::anyhow!("upload of {label} failed: {}", e.source))?;
+        {
+            Ok(handle) => handle,
+            Err(e) => {
+                // A failed data phase can leave a partial object on the device, which
+                // the library deliberately doesn't auto-delete — the same hazard
+                // `fill_with_cancel` handles, and it was ignored here. Handing it to
+                // the shared cleanup rather than deleting it inline keeps one removal
+                // path instead of two that can disagree.
+                if let Some(partial) = e.partial {
+                    written.push(partial);
+                }
+                return Err(anyhow::anyhow!("upload of {label} failed: {}", e.source));
+            }
+        };
         let elapsed = start.elapsed();
         written.push(handle);
 
@@ -224,14 +296,24 @@ async fn bench() -> Result<()> {
             println!("  !! free space did not move — the convergence loop cannot work as designed");
         }
     }
+    Ok(())
+}
 
+/// Remove exactly what `bench` created — the handles it collected, then the folder.
+///
+/// Bounded to handles this run holds, which is the same guarantee the rest of the
+/// crate gives: nothing is removed by name-matching or by walking the device.
+async fn bench_cleanup(
+    storage: &mut Storage,
+    dir: ObjectHandle,
+    written: &[ObjectHandle],
+) -> Result<()> {
     print!("cleaning up... ");
+    let _ = io::Write::flush(&mut io::stdout());
     for handle in written {
-        storage.delete(handle).await?;
+        storage.delete(*handle).await?;
     }
     storage.delete(dir).await?;
-    storage.refresh().await?;
-    println!("free now {}", human_bytes(storage.info().free_space));
     Ok(())
 }
 
@@ -451,4 +533,121 @@ async fn clean(dir_name: &str) -> Result<()> {
         human_bytes(report.free)
     );
     Ok(())
+}
+
+/// Empty a named root folder, whatever is in it.
+///
+/// The one CLI verb that removes content this tool didn't write, so it says what it
+/// deleted, by name, as it goes. It reaches [`engine::purge_fill_dir`] — the same
+/// function behind `fill --overwrite` — rather than reimplementing the walk, which is
+/// also why the folder itself survives: `--overwrite` needs somewhere to write into
+/// immediately afterwards. The bytes are what matter here; an empty folder isn't worth
+/// a second copy of "is this folder empty" living in the CLI.
+async fn purge(dir_name: &str) -> Result<()> {
+    let device = open().await?;
+    let mut storage = writable_storage(&device).await?;
+    let removed = engine::purge_fill_dir(&mut storage, dir_name, |event| {
+        if let Event::Deleted { name, bytes } = event {
+            println!("  deleted {name} ({})", human_bytes(bytes));
+        }
+    })
+    .await?;
+
+    if removed == 0 {
+        println!("nothing to remove — no {dir_name} folder at the storage root, or it was empty");
+    } else {
+        println!("emptied {dir_name}: {removed} item(s) deleted (the folder itself is left)");
+    }
+    storage.refresh().await?;
+    println!("free now {}", human_bytes(storage.info().free_space));
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mtp_rs::{VirtualDeviceConfig, VirtualStorageConfig};
+
+    /// `bench` used to be a straight line of `?` from "create the folder" to "clean it
+    /// up", so a failed upload exited with everything before it committed and the
+    /// folder still there — bytes that `clean` could not match and
+    /// `find_filler_folders` could not see, on a device whose owner had no way to find
+    /// out.
+    ///
+    /// The failure is forced by taking the write bit off the folder, not by running it
+    /// out of room: the virtual device reports free space from its configured capacity
+    /// but writes through to a real directory, so an over-capacity upload reports a
+    /// nonsense delta and *succeeds*. A permission error is one the backing filesystem
+    /// actually produces.
+    #[tokio::test]
+    async fn a_failed_bench_upload_leaves_nothing_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let device = MtpDevice::builder()
+            .open_virtual(VirtualDeviceConfig {
+                manufacturer: "Amazon".into(),
+                model: "Virtual Kindle".into(),
+                serial: "BENCH001".into(),
+                storages: vec![VirtualStorageConfig {
+                    description: "Internal Storage".into(),
+                    capacity: 200 * MIB,
+                    backing_dir: tmp.path().to_path_buf(),
+                    read_only: false,
+                }],
+                watch_backing_dirs: false,
+                event_poll_interval: std::time::Duration::ZERO,
+                ..Default::default()
+            })
+            .await
+            .expect("virtual device should open");
+        let mut storage = writable_storage(&device).await.expect("storage");
+
+        let dir = storage
+            .create_folder(Some(ObjectHandle::ROOT), BENCH_DIR)
+            .await
+            .expect("create bench folder");
+
+        // Stands in for the objects a real run commits before the failing one. They
+        // are in `written`, and if cleanup doesn't reach them they are stranded for
+        // good — no verb in the tool could find a `bench_*.bin` to remove.
+        let committed = storage
+            .upload(
+                Some(dir),
+                // A name none of BENCH_SIZES uses: overwriting an existing file is
+                // allowed in a read-only folder (the write bit governs create and
+                // delete, not modify), which would let the first upload succeed and
+                // re-key the handle underneath us.
+                NewObjectInfo::file("bench_committed.bin", MIB),
+                kindlefill_core::ZeroStream::new(MIB),
+            )
+            .await
+            .expect("seed a committed object");
+        let mut written = vec![committed];
+
+        let bench_path = tmp.path().join(BENCH_DIR);
+        set_writable(&bench_path, false);
+        let measured = bench_uploads(&mut storage, dir, &mut written).await;
+        set_writable(&bench_path, true);
+
+        assert!(
+            measured.is_err(),
+            "an unwritable folder must fail the upload"
+        );
+
+        bench_cleanup(&mut storage, dir, &written)
+            .await
+            .expect("cleanup must run after a failed measurement");
+
+        // Asked of the backing directory rather than the device's object list: this is
+        // the thing a user would be left with, and it is what "self-cleaning" claims.
+        assert!(
+            !bench_path.exists(),
+            "a failed bench must leave no {BENCH_DIR} behind"
+        );
+    }
+
+    fn set_writable(path: &std::path::Path, writable: bool) {
+        let mut perms = std::fs::metadata(path).expect("metadata").permissions();
+        perms.set_readonly(!writable);
+        std::fs::set_permissions(path, perms).expect("set permissions");
+    }
 }

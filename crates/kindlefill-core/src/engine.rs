@@ -126,6 +126,11 @@ pub enum FillError {
     AlreadyBelowWindow {
         free: u64,
         low: u64,
+        /// Filler found under root folders other than the one asked for. Empty is
+        /// meaningful: it means the space genuinely isn't ours to give back. Carried
+        /// on the error so neither front end has to re-ask the device — and so the two
+        /// of them can't word the answer differently.
+        elsewhere: Vec<FillerFolder>,
     },
     /// The requested filler folder name isn't usable.
     BadName(NameError),
@@ -138,11 +143,31 @@ impl std::fmt::Display for FillError {
             FillError::ReadOnly { description } => {
                 write!(f, "storage {description:?} is read-only")
             }
-            FillError::AlreadyBelowWindow { free, low } => write!(
-                f,
-                "only {free} bytes free, already below the {low}-byte target; \
-                 nothing to fill"
-            ),
+            FillError::AlreadyBelowWindow {
+                free,
+                low,
+                elsewhere,
+            } => {
+                write!(
+                    f,
+                    "only {free} bytes free, already below the {low}-byte target; \
+                     nothing to fill"
+                )?;
+                // "Nothing to fill" is true and, on its own, misleading: the folder
+                // name resets to the default every launch, so the space this tool
+                // could give back is routinely sitting under a name the user chose.
+                // Same wording as `clean`'s equivalent, because it is the same answer.
+                if let Some(f2) = elsewhere.first() {
+                    write!(
+                        f,
+                        " — but {} of filler is in {}; switch to that folder and try \
+                         again",
+                        crate::human_bytes(f2.bytes),
+                        f2.name
+                    )?;
+                }
+                Ok(())
+            }
             FillError::BadName(e) => write!(f, "{e}"),
             FillError::Mtp(e) => write!(f, "{e}"),
         }
@@ -477,11 +502,20 @@ where
             None => true,
         }
     {
-        // Below the target with no filler of ours to remove: the space belongs to
-        // something else, and nothing this tool can do will free it.
+        // Below the target with no filler of ours *in the folder we were given*. The
+        // refusal stands — `fill` manages the folder it was asked about, and going
+        // hunting for another one to empty would be exactly the surprise this crate
+        // avoids everywhere else. But look before answering, so the message can say
+        // where the space went instead of implying it was never ours.
+        let elsewhere = find_filler_folders(storage)
+            .await?
+            .into_iter()
+            .filter(|f| f.name != dir_name)
+            .collect();
         return Err(FillError::AlreadyBelowWindow {
             free: free_start,
             low: window.low(),
+            elsewhere,
         });
     }
 

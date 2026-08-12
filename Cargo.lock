@@ -1878,6 +1878,7 @@ dependencies = [
  "clap",
  "kindlefill-core",
  "mtp-rs",
+ "tempfile",
  "tokio",
 ]
 

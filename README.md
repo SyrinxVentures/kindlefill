@@ -170,16 +170,24 @@ there is nothing there to lose. It says how much is already there and continues 
 
 ```bash
 cargo run -p kindlefill-cli -- probe     # what do we see? changes nothing
-cargo run -p kindlefill-cli -- bench     # throughput + free-space sanity; self-cleaning
+cargo run -p kindlefill-cli -- bench     # throughput + free-space sanity; tidies up after itself
 cargo run -p kindlefill-cli -- status    # free space and existing filler
 cargo run -p kindlefill-cli -- fill      # fill to 50-90 MB free
 cargo run -p kindlefill-cli -- fill --low 40MB --high 80MB
 cargo run -p kindlefill-cli -- clean     # remove all filler
+cargo run -p kindlefill-cli -- purge --dir some_folder   # empty a folder, whatever is in it
 ```
 
-`status`, `fill` and `clean` take `--dir` to work in a folder other than `fill_disk`,
-and `fill --overwrite` empties that folder first — including files this tool didn't
-write. Without it, nothing else in the crate removes them.
+`status`, `fill` and `clean` take `--dir` to work in a folder other than `fill_disk`.
+
+Two things delete files this tool didn't write, and they are the only two: `fill
+--overwrite`, which empties the target folder before filling it, and `purge`, which
+empties a named folder and does nothing else. `purge` has no default `--dir` — the verb
+that deletes other people's files shouldn't be runnable from muscle memory — and it
+leaves the (now empty) folder in place. It exists because `clean` deliberately can't
+help here: `clean` removes only names it can prove it wrote, so it is no use for taking
+back a folder, or for clearing up after a `bench` run that failed before it could tidy
+up. `bench` names `purge` in that failure message.
 
 `status` also reports anything in that folder this tool didn't write, and any staged
 firmware update at the root. Deleting an update is the app's job; the CLI only says

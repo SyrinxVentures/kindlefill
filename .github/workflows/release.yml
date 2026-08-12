@@ -17,6 +17,12 @@ jobs:
     # Apple silicon runner, which is what the DMG is built for. There is no Intel build
     # because there is no Intel Mac to test one on — see the README's Platforms section.
     runs-on: macos-latest
+    env:
+      # Lifted to job-level env because the `secrets` context is not available inside a
+      # step-level `if:`. Referencing it there is not a runtime error — it fails the
+      # whole file's validation, so no job runs at all and the failure shows up as the
+      # filename rather than the workflow name.
+      ASC_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -37,11 +43,11 @@ jobs:
       # such file — so if the key is provided as a secret, write it out and hand over
       # the path. Skipped entirely when the Apple ID method is being used instead.
       - name: Materialize the App Store Connect key
-        if: ${{ secrets.APPLE_API_KEY_P8 != '' }}
+        if: env.ASC_KEY_P8 != ''
         run: |
           mkdir -p ~/.appstoreconnect/private_keys
           KEY=~/.appstoreconnect/private_keys/AuthKey_${{ secrets.APPLE_API_KEY }}.p8
-          printf '%s' "${{ secrets.APPLE_API_KEY_P8 }}" > "$KEY"
+          printf '%s' "$ASC_KEY_P8" > "$KEY"
           chmod 600 "$KEY"
           echo "APPLE_API_KEY_PATH=$KEY" >> "$GITHUB_ENV"
 

@@ -95,10 +95,33 @@ pub enum Event {
     Progress(FillProgress),
     /// One filler object landed. `free` is the freshly re-read value.
     Wrote { name: String, bytes: u64, free: u64 },
-    /// One filler object was removed.
-    Deleted { name: String, bytes: u64 },
+    /// One object was removed. See [`DeletedKind`] — a consumer keeping a filler tally
+    /// needs to know which deletions are filler, and the event used to make it guess.
+    Deleted {
+        name: String,
+        bytes: u64,
+        kind: DeletedKind,
+    },
     /// Terminal reading.
     Finished { free: u64 },
+}
+
+/// What a [`Event::Deleted`] was.
+///
+/// Three unrelated things emit that event — `clean` and the fill's removal branch,
+/// which are always our own filler; `purge_fill_dir`, which is whatever was in the
+/// folder; and `delete_staged_updates`, which is a firmware image and never filler.
+/// Without this the app subtracted all three from its "existing filler" tally, so
+/// deleting a 1.5 GB update from a device holding ten filler files briefly read "9
+/// files, 8.5 GB". Classified where the fact is known rather than inferred downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletedKind {
+    /// Filler this tool wrote, by [`filler_sequence`]'s reading of the name.
+    Filler,
+    /// Something in the filler folder that this tool did not write.
+    Foreign,
+    /// A staged over-the-air firmware image.
+    Update,
 }
 
 /// How a fill ended.
@@ -282,6 +305,7 @@ where
         on_event(Event::Deleted {
             name: update.filename.clone(),
             bytes: update.size,
+            kind: DeletedKind::Update,
         });
     }
 
@@ -546,9 +570,18 @@ where
                 removed += purge_children(storage, child.handle, on_event).await?;
             }
             storage.delete(child.handle).await?;
+            // Asked of `filler_sequence` rather than assumed: a purge removes both
+            // our filler and the folder's other contents, and a consumer keeping a
+            // filler tally has to be able to tell which was which.
+            let kind = if child.is_file() && filler_sequence(&child.filename).is_some() {
+                DeletedKind::Filler
+            } else {
+                DeletedKind::Foreign
+            };
             on_event(Event::Deleted {
                 name: child.filename,
                 bytes: child.size,
+                kind,
             });
             removed += 1;
         }
@@ -673,6 +706,7 @@ where
                         on_event(Event::Deleted {
                             name: victim.filename.clone(),
                             bytes: victim.size,
+                            kind: DeletedKind::Filler,
                         });
                         continue;
                     }
@@ -799,6 +833,7 @@ where
         on_event(Event::Deleted {
             name: filler.filename,
             bytes: filler.size,
+            kind: DeletedKind::Filler,
         });
     }
 

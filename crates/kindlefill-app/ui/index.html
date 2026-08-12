@@ -230,7 +230,8 @@
   </section>
 
   <section class="block grow">
-    <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="bar">
+    <div class="bar" role="progressbar" aria-label="Fill progress"
+         aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="bar">
       <i id="barfill"></i>
     </div>
     <div class="meta"><span id="p-left">Idle</span><span id="p-right"></span></div>
@@ -261,7 +262,10 @@ let observedRate = 25.5 * MB;
 function log(line) {
   const el = $('log');
   const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 20;
-  el.textContent += (el.textContent ? '\n' : '') + line;
+  // Append a node rather than rewriting textContent. The whole box is an aria-live
+  // region, and replacing its only text node reads to assistive tech as the entire log
+  // changing — so every new line re-announced every line before it.
+  el.appendChild(document.createTextNode((el.childNodes.length ? '\n' : '') + line));
   if (atBottom) el.scrollTop = el.scrollHeight;
 }
 
@@ -509,6 +513,9 @@ listen('kindlefill://progress', (e) => {
   $('bar').setAttribute('aria-valuenow', p.percent.toFixed(0));
   if (p.rate > 0) observedRate = p.rate;
   $('p-left').textContent = `${p.percent.toFixed(1)}% — ${p.done_human} of ${p.total_human}`;
+  // The same sentence the sighted reading gets. A bare "37" is a true number and a
+  // useless announcement on a transfer measured in gigabytes.
+  $('bar').setAttribute('aria-valuetext', $('p-left').textContent);
   $('p-right').textContent = `${p.rate_human} · ${p.eta_human} left`;
 });
 

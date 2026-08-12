@@ -4,8 +4,20 @@ Fills a Kindle's storage down to a target free-space window (default 50–90 MB)
 device can't download an OTA firmware update, and removes the filler again afterwards.
 
 Targets modern MTP Kindles (11th gen and newer — 2024 Paperwhite, Colorsoft, Scribe,
-basic 2024), which no longer mount as USB mass storage. macOS is the target platform;
-the stack is portable but untested elsewhere.
+basic 2024), which no longer mount as USB mass storage.
+
+**Platforms.** macOS is the only one this has ever been compiled or run on. Windows and
+Linux are not "supported but untested" — they are untried. The code carries real
+affordances for both (`windows_subsystem`, a no-op `ptpcamerad` off macOS, an `.ico` in
+the bundle set), which makes it look like someone checked, and nobody has. The unknown
+isn't this app's code, it's whether `mtp-rs`'s WPD and libusb backends behave the way
+the macOS one does. Reports either way are welcome.
+
+**Sizes are binary.** 1 GB here means 1 GiB — 1024³ bytes — throughout: the CLI's
+`--low 50MB`, the app's fields, and every figure printed. So the capacity shown for a
+device will read lower than the number on its box, which is quoted in SI GB. Internally
+it is consistent — `parse_size`, `human_bytes` and the frontend all use 1024 — so no
+arithmetic depends on which convention you assume; only the labels are non-SI.
 
 ## Status
 
@@ -169,7 +181,7 @@ there is nothing there to lose. It says how much is already there and continues 
 ## CLI
 
 ```bash
-cargo run -p kindlefill-cli -- probe     # what do we see? changes nothing
+cargo run -p kindlefill-cli -- probe     # what do we see? nothing on the device changes
 cargo run -p kindlefill-cli -- bench     # throughput + free-space sanity; tidies up after itself
 cargo run -p kindlefill-cli -- status    # free space and existing filler
 cargo run -p kindlefill-cli -- fill      # fill to 50-90 MB free
@@ -192,6 +204,13 @@ up. `bench` names `purge` in that failure message.
 `status` also reports anything in that folder this tool didn't write, and any staged
 firmware update at the root. Deleting an update is the app's job; the CLI only says
 it's there.
+
+`probe` touches nothing on the device — but it isn't inert on your Mac. It answers
+"can this tool get `ptpcamerad` out of the way without sudo?" the only way that
+question can be answered, which is by trying: it sends the daemon a `SIGKILL` and
+reports whether that worked. launchd restarts it within a second, and `fill` then keeps
+it away for the length of the transfer rather than permanently. Worth knowing before
+running it, not because it's risky but because "changes nothing" would be a lie.
 
 `fill` renders a live progress bar with throughput and ETA:
 
@@ -248,7 +267,7 @@ crates/kindlefill-core/    plan.rs        pure convergence logic, no I/O
                           zeros.rs       synthetic byte source for uploads
                           engine.rs      drives a real mtp_rs::Storage
                           ptpcamerad.rs  keeps Apple's camera daemon off the device
-crates/kindlefill-cli/     probe / bench / status / fill / clean
+crates/kindlefill-cli/     probe / bench / status / fill / clean / purge
 crates/kindlefill-app/     Tauri desktop UI (static HTML frontend, no build step)
 ```
 

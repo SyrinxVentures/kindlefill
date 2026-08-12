@@ -990,3 +990,59 @@ async fn child_names(storage: &Storage, dir: ObjectHandle) -> Vec<String> {
     names.sort();
     names
 }
+
+/// A `Deleted` event that doesn't say what was deleted makes its consumer guess, and
+/// the app guessed "filler" for all three producers — so removing a 1.5 GB firmware
+/// image subtracted a filler file the device never had.
+#[tokio::test]
+async fn deletions_say_which_of_them_are_filler() {
+    let tmp = tempfile::tempdir().unwrap();
+    let device = open(tmp.path()).await;
+    let mut storage = storage_of(&device).await;
+
+    put(&storage, ObjectHandle::ROOT, "update_kindle.bin", 4096).await;
+    engine::fill(&mut storage, window(), DIR, |_| {})
+        .await
+        .expect("fill");
+    let dir = engine::find_fill_dir(&storage, DIR).await.unwrap().unwrap();
+    put(&storage, dir.handle, "mybook.azw3", 1024).await;
+
+    let mut kinds = Vec::new();
+    engine::delete_staged_updates(&mut storage, &["update_kindle.bin".to_string()], |ev| {
+        if let engine::Event::Deleted { name, kind, .. } = ev {
+            kinds.push((name, kind));
+        }
+    })
+    .await
+    .expect("delete update");
+    assert_eq!(
+        kinds,
+        vec![("update_kindle.bin".to_string(), engine::DeletedKind::Update)]
+    );
+
+    // A purge removes both at once, which is the case that has to be split per object
+    // rather than per operation.
+    let mut kinds = Vec::new();
+    engine::purge_fill_dir(&mut storage, DIR, |ev| {
+        if let engine::Event::Deleted { name, kind, .. } = ev {
+            kinds.push((name, kind));
+        }
+    })
+    .await
+    .expect("purge");
+
+    assert_eq!(
+        kinds
+            .iter()
+            .find(|(n, _)| n == "mybook.azw3")
+            .map(|(_, k)| *k),
+        Some(engine::DeletedKind::Foreign),
+        "a book in the folder is not our filler: {kinds:?}"
+    );
+    assert!(
+        kinds
+            .iter()
+            .any(|(n, k)| n.starts_with("fill_") && *k == engine::DeletedKind::Filler),
+        "the filler in the same folder must still be reported as filler: {kinds:?}"
+    );
+}

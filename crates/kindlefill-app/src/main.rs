@@ -305,7 +305,16 @@ fn forward(app: &AppHandle, event: Event) {
     match &event {
         Event::Started { free, .. } => device_update(app, Some(*free), 0, 0),
         Event::Wrote { bytes, free, .. } => device_update(app, Some(*free), 1, *bytes as i64),
-        Event::Deleted { bytes, .. } => device_update(app, None, -1, -(*bytes as i64)),
+        // Only filler moves the filler tally. A purge also removes the folder's other
+        // contents and `delete_updates` removes a firmware image — charging those to
+        // "existing filler" is how deleting a 1.5 GB update briefly read as the device
+        // losing a filler file it never had.
+        Event::Deleted {
+            bytes,
+            kind: engine::DeletedKind::Filler,
+            ..
+        } => device_update(app, None, -1, -(*bytes as i64)),
+        Event::Deleted { .. } => {}
         Event::Finished { free } => device_update(app, Some(*free), 0, 0),
         Event::Progress(_) => {}
     }
@@ -346,7 +355,7 @@ fn forward(app: &AppHandle, event: Event) {
                 human_bytes(free)
             ),
         ),
-        Event::Deleted { name, bytes } => {
+        Event::Deleted { name, bytes, .. } => {
             log(app, format!("Deleted {name} ({}).", human_bytes(bytes)))
         }
         Event::Finished { free } => log(app, format!("Finished at {} free.", human_bytes(free))),

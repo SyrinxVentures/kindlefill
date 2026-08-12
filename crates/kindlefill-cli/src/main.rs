@@ -84,7 +84,16 @@ fn parse_size(raw: &str) -> Result<u64, String> {
     digits
         .parse::<f64>()
         .map_err(|_| format!("not a size: {raw}"))
-        .map(|n| (n * scale as f64) as u64)
+        .and_then(|n| {
+            // `as u64` saturates, so a negative or a NaN would quietly become 0 — and
+            // `Window::new(0, 90MB)` is perfectly valid, so `--low -5MB` was accepted
+            // and filled toward a 45 MB aim without anyone being told. Refuse rather
+            // than reinterpret: the user asked for something, and this isn't it.
+            if !n.is_finite() || n < 0.0 {
+                return Err(format!("not a size: {raw}"));
+            }
+            Ok((n * scale as f64) as u64)
+        })
 }
 
 #[tokio::main]
@@ -431,7 +440,7 @@ async fn fill(low: u64, high: u64, dir_name: &str, overwrite: bool) -> Result<()
 
     if overwrite {
         let removed = engine::purge_fill_dir(&mut storage, dir_name, |event| {
-            if let Event::Deleted { name, bytes } = event {
+            if let Event::Deleted { name, bytes, .. } = event {
                 println!("  deleted {name} ({})", human_bytes(bytes));
             }
         })
@@ -508,7 +517,7 @@ async fn clean(dir_name: &str) -> Result<()> {
     let mut storage = writable_storage(&device).await?;
     let mut removed = 0u64;
     let report = engine::clean(&mut storage, dir_name, |event| match event {
-        Event::Deleted { name, bytes } => {
+        Event::Deleted { name, bytes, .. } => {
             removed += bytes;
             println!("  deleted {name} ({})", human_bytes(bytes));
         }
@@ -547,7 +556,7 @@ async fn purge(dir_name: &str) -> Result<()> {
     let device = open().await?;
     let mut storage = writable_storage(&device).await?;
     let removed = engine::purge_fill_dir(&mut storage, dir_name, |event| {
-        if let Event::Deleted { name, bytes } = event {
+        if let Event::Deleted { name, bytes, .. } = event {
             println!("  deleted {name} ({})", human_bytes(bytes));
         }
     })
@@ -567,6 +576,25 @@ async fn purge(dir_name: &str) -> Result<()> {
 mod tests {
     use super::*;
     use mtp_rs::{VirtualDeviceConfig, VirtualStorageConfig};
+
+    #[test]
+    fn sizes_that_are_not_sizes_are_refused_rather_than_rounded_to_zero() {
+        assert_eq!(parse_size("50MB"), Ok(50 * MIB));
+        assert_eq!(parse_size("2GB"), Ok(2 * 1024 * MIB));
+        assert_eq!(parse_size(" 90 MiB "), Ok(90 * MIB));
+        assert_eq!(parse_size("1024"), Ok(1024));
+        assert_eq!(
+            parse_size("0MB"),
+            Ok(0),
+            "zero is a number, if a strange one"
+        );
+
+        // Each of these used to parse cleanly to 0 and fill toward an aim nobody asked
+        // for: the float cast saturates on negatives and maps NaN to zero.
+        for bad in ["-5MB", "nanMB", "infGB", "-0.5GB", "-1", "not-a-size"] {
+            assert!(parse_size(bad).is_err(), "{bad} should be refused");
+        }
+    }
 
     /// `bench` used to be a straight line of `?` from "create the folder" to "clean it
     /// up", so a failed upload exited with everything before it committed and the

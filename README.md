@@ -165,14 +165,23 @@ quarantines files that arrive from elsewhere. Releases are a different build: th
 workflow signs them with a Developer ID and sends them to Apple's notary service, which
 is what lets a *downloaded* copy open without the Privacy & Security detour.
 
-Notarization needs five secrets on the repository — `APPLE_CERTIFICATE` (a
-base64-encoded Developer ID Application `.p12`), `APPLE_CERTIFICATE_PASSWORD`,
-`APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD` (an app-specific password, not
-the account password) and `APPLE_TEAM_ID`. Without them the workflow still produces a
-working DMG; it just isn't notarized, and the release notes say so rather than claiming
-otherwise. The workflow asks `spctl` whether Gatekeeper actually accepts the bundle and
-picks its release notes from the answer, so a failed notarization can't be published as
-a successful one.
+Two halves, and they need different credentials.
+
+**Signing** needs a **Developer ID Application** certificate — `APPLE_CERTIFICATE` (the
+`.p12`, base64-encoded), `APPLE_CERTIFICATE_PASSWORD` and `APPLE_SIGNING_IDENTITY`. This
+is a distinct certificate type: an *Apple Distribution* certificate signs for the App
+Store and cannot be used to notarize for distribution outside it, so having one does not
+mean you have the other.
+
+**Notarization** takes either an App Store Connect API key — `APPLE_API_ISSUER`,
+`APPLE_API_KEY`, `APPLE_API_KEY_PATH` — or an Apple ID with an app-specific password:
+`APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`. Prefer the API key where one already
+exists; it can be revoked on its own and isn't a password to somebody's account.
+
+Without any of it the workflow still produces a working DMG. It just isn't notarized,
+and the release notes say so rather than claiming otherwise: the build asks `spctl`
+whether Gatekeeper actually accepts the bundle and picks between two sets of notes from
+the answer, so a failed notarization cannot be published as a successful one.
 
 The `-p kindlefill-app` above is the crate; the binary it produces is `KindleFill`.
 Unbundled, macOS takes the Dock and app-menu label from the executable name, so

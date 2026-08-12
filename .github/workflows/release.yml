@@ -45,9 +45,19 @@ jobs:
       - name: Build the app bundle and DMG
         working-directory: crates/kindlefill-app
         env:
+          # Signing. The certificate must be a *Developer ID Application* one — an
+          # "Apple Distribution" cert signs for the App Store and cannot notarize for
+          # distribution outside it.
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # Notarization, either way round — Tauri takes an App Store Connect API key or
+          # an Apple ID with an app-specific password. The API key is the better one to
+          # use if the team already has one: it is revocable on its own, and it isn't a
+          # password to a human's account.
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_PATH: ${{ secrets.APPLE_API_KEY_PATH }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}

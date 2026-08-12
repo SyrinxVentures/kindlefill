@@ -16,7 +16,8 @@ use kindlefill_core::{engine, human_bytes, human_eta, is_disconnected,
                       Event, Window};
 use mtp_rs::{CancelToken, MtpDevice, Storage};
 use serde::Serialize;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -27,8 +28,46 @@ const EV_DEVICE: &str = "kindlefill://device";
 
 #[derive(Default)]
 struct AppState {
-    /// Present only while an operation is running.
-    cancel: Mutex<Option<CancelToken>>,
+    /// Set for as long as any device operation is running.
+    ///
+    /// The device is opened per operation, so two commands in flight means two
+    /// [`open_device`] calls: the second fails for exclusive access, and the frontend
+    /// unwinding *that* failure is what strands the first — its Stop button goes away
+    /// while its transfer keeps running. The webview is supposed to prevent this, but
+    /// it is a webview, and a seventeen-minute write that cannot be stopped is too
+    /// expensive to leave resting on that alone.
+    busy: AtomicBool,
+    /// The running fill's cancel flag, held as the `Arc` the token wraps rather than
+    /// as the token: a finishing fill has to prove the entry is its own before
+    /// clearing it, [`CancelToken`] has no equality, and two tokens over one `Arc` are
+    /// one flag — which [`Arc::ptr_eq`] can say.
+    cancel: Mutex<Option<Arc<AtomicBool>>>,
+}
+
+/// Holds the single-operation slot until the operation ends, however it ends.
+///
+/// Each command has several `?` exits and releasing before every one of them is how a
+/// release gets forgotten — after which the app refuses everything until it is
+/// restarted, which is a worse bug than the one being fixed.
+struct OpGuard<'a>(&'a AtomicBool);
+
+impl Drop for OpGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Claim the slot, or refuse — in one indivisible step.
+///
+/// Compare-exchange rather than read-then-write: two commands can both read `false`
+/// before either writes `true`, and an RAII guard doesn't help with that because it is
+/// the *acquire* that has to be atomic.
+fn claim(state: &AppState) -> Result<OpGuard<'_>, String> {
+    state
+        .busy
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .map(|_| OpGuard(&state.busy))
+        .map_err(|_| "Another operation is already running.".to_string())
 }
 
 /// One object on the device, named for a person to recognize.
@@ -309,7 +348,8 @@ fn forward(app: &AppHandle, event: Event) {
 }
 
 #[tauri::command]
-async fn detect(dir_name: String) -> Result<DeviceSnapshot, String> {
+async fn detect(state: State<'_, AppState>, dir_name: String) -> Result<DeviceSnapshot, String> {
+    let _op = claim(&state)?;
     engine::validate_dir_name(&dir_name).map_err(|e| e.to_string())?;
     let mut session = open_device().await?;
     let storage = &mut session.storage;
@@ -388,7 +428,12 @@ async fn detect(dir_name: String) -> Result<DeviceSnapshot, String> {
 /// actually a root-level `update_*.bin` and ignores anything else. A name that isn't
 /// one of those deletes nothing.
 #[tauri::command]
-async fn delete_updates(app: AppHandle, names: Vec<String>) -> Result<String, String> {
+async fn delete_updates(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    names: Vec<String>,
+) -> Result<String, String> {
+    let _op = claim(&state)?;
     if names.is_empty() {
         return Ok("Nothing selected.".to_string());
     }
@@ -422,18 +467,23 @@ async fn start_fill(
     dir_name: String,
     overwrite: bool,
 ) -> Result<String, String> {
+    let _op = claim(&state)?;
     let window = Window::new(low, high).map_err(|e| e.to_string())?;
     engine::validate_dir_name(&dir_name).map_err(|e| e.to_string())?;
 
-    let token = CancelToken::new();
-    // Scoped so the guard is dropped before the first await — a MutexGuard held across
-    // an await point would make this future non-Send and fail to compile.
-    {
-        *state.cancel.lock().unwrap() = Some(token.clone());
-    }
-
     let mut session = open_device().await?;
     let storage = &mut session.storage;
+
+    // Published only once the device is open, not before: a token published ahead of a
+    // failed open outlives the command that made it, and Stop then pulls on a token
+    // nothing is watching.
+    let flag = Arc::new(AtomicBool::new(false));
+    let token = CancelToken::from_arc(flag.clone());
+    // Scoped so the guard is dropped before the next await — a MutexGuard held across
+    // an await point would make this future non-Send and fail to compile.
+    {
+        *state.cancel.lock().unwrap() = Some(flag.clone());
+    }
 
     // Taking the folder over is a separate, explicit act that happens before any
     // filling — so if it fails, nothing has been written yet, and if the caller didn't
@@ -456,7 +506,14 @@ async fn start_fill(
         })
         .await;
 
-    *state.cancel.lock().unwrap() = None;
+    // Ours and only ours. Clearing whatever happens to be in the slot is how one
+    // command takes away another's Stop button.
+    {
+        let mut published = state.cancel.lock().unwrap();
+        if published.as_ref().is_some_and(|f| Arc::ptr_eq(f, &flag)) {
+            *published = None;
+        }
+    }
 
     match outcome.map_err(|e| explain_fill(&e))? {
         engine::Outcome::InWindow { free } => Ok(format!(
@@ -482,6 +539,7 @@ async fn start_clean(
     state: State<'_, AppState>,
     dir_name: String,
 ) -> Result<String, String> {
+    let _op = claim(&state)?;
     engine::validate_dir_name(&dir_name).map_err(|e| e.to_string())?;
     let mut session = open_device().await?;
     let storage = &mut session.storage;
@@ -490,7 +548,6 @@ async fn start_clean(
         .await
         .map_err(|e| explain_fill(&e))?;
 
-    *state.cancel.lock().unwrap() = None;
     if report.removed > 0 {
         return Ok(format!(
             "Removed {} filler file{} ({}) from {dir_name} — {} free.",
@@ -529,8 +586,12 @@ fn device_present() -> bool {
 
 #[tauri::command]
 fn cancel_fill(state: State<'_, AppState>) {
-    if let Some(token) = state.cancel.lock().unwrap().as_ref() {
-        token.cancel();
+    if let Some(flag) = state.cancel.lock().unwrap().as_ref() {
+        // Back through a token rather than storing `true` into the flag directly:
+        // `CancelToken::cancel` is where the memory ordering that makes a cancellation
+        // visible to the engine is decided, and setting the bit here would be a second
+        // copy of that decision, free to drift from the first.
+        CancelToken::from_arc(flag.clone()).cancel();
     }
 }
 
@@ -561,4 +622,40 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to start KindleFill");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_second_operation_is_refused_while_one_is_running() {
+        let state = AppState::default();
+        let first = claim(&state).expect("the first command takes the slot");
+        assert!(claim(&state).is_err(), "a second command must be refused");
+        drop(first);
+        assert!(
+            claim(&state).is_ok(),
+            "the slot has to come back when the operation ends, or the app wedges"
+        );
+    }
+
+    /// The refusal has to be inert. A second Fill that clears the cancel slot on its
+    /// way out is the failure this whole wave exists to stop: the running transfer
+    /// keeps going with nothing left for Stop to pull on.
+    #[test]
+    fn a_refused_command_leaves_the_running_fills_cancel_token_alone() {
+        let state = AppState::default();
+        let _op = claim(&state).expect("the fill takes the slot");
+        let flag = Arc::new(AtomicBool::new(false));
+        *state.cancel.lock().unwrap() = Some(flag.clone());
+
+        assert!(claim(&state).is_err());
+
+        let published = state.cancel.lock().unwrap();
+        assert!(
+            published.as_ref().is_some_and(|f| Arc::ptr_eq(f, &flag)),
+            "the refused command disturbed the running fill's cancel token"
+        );
+    }
 }

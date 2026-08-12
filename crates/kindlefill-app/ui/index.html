@@ -244,6 +244,11 @@ const { listen } = window.__TAURI__.event;
 const MB = 1024 * 1024;
 const $ = (id) => document.getElementById(id);
 let device = null, busy = false;
+// Guarded rather than merely debounced. Disabling the buttons stops a *click* landing
+// mid-detect, but the folder-name field re-detects on its own timer, and a detect takes
+// longer than the debounce — so two could overlap and the second open would fail for
+// exclusive access. A detect requested during one is folded into a single re-run after.
+let detecting = false, detectAgain = false;
 // Only shapes the pre-flight estimate. Seeded from a Paperwhite Signature Edition and
 // replaced by this device's own measured throughput once a transfer reports one — so
 // the second estimate you see is about your Kindle and cable, not someone else's.
@@ -322,17 +327,44 @@ function estimate() {
     `About ${gb} GB to write — roughly ${mins < 1 ? 'under a minute' : mins + ' min'} at ~${(observedRate / MB).toFixed(0)} MB/s.`;
 }
 
+/// The one place that decides what is clickable.
+///
+/// Five sites used to answer this question — setBusy, renderDevice, the Overwrite
+/// handler, refresh and showNoDevice — and three of them had never heard of `busy`.
+/// That is how Fill became clickable *during* a fill: reticking Overwrite ran a
+/// recomputation that only knew about the device, and the second click opened the
+/// device a second time while the first operation still held it, which strands the
+/// first with no reachable Stop. Every transition calls this, and nothing else in this
+/// module assigns `.disabled`.
+function updateControls() {
+  const usable = !!device && device.writable;
+  // A detect holds the device exactly as an operation does, so it locks the same set.
+  const locked = busy || detecting;
+
+  $('fill').disabled = locked || !usable || blockedByForeign();
+  $('clean').disabled = locked || !device || device.filler_files === 0;
+  $('refresh').disabled = locked;
+  // `busy` alone, and it does not latch off when pressed. The backend publishes the
+  // cancel token only once the device is open, so a Stop landing in the second or two
+  // before that has nothing to pull on — greying the button there would leave the
+  // transfer running with its only exit already spent. Pressing again works; the log
+  // line is the acknowledgement.
+  $('stop').disabled = !busy;
+  $('low').disabled = locked;
+  $('high').disabled = locked;
+  // The folder name selects what the running operation is writing into; changing it
+  // mid-fill would leave the UI describing a folder the engine isn't using. The same
+  // goes for the button that adopts a folder found under another name.
+  $('dirname').disabled = locked;
+  $('rename').disabled = locked;
+  $('useelsewhere').disabled = locked;
+  $('delupdates').disabled = locked || !device || device.updates.length === 0;
+  $('overwrite').disabled = locked;
+}
+
 function setBusy(on) {
   busy = on;
-  $('fill').disabled = on || !device || blockedByForeign();
-  $('clean').disabled = on || !device;
-  $('refresh').disabled = on;
-  $('stop').disabled = !on;
-  $('low').disabled = on; $('high').disabled = on;
-  // The folder name selects what the running operation is writing into; changing it
-  // mid-fill would leave the UI describing a folder the engine isn't using.
-  $('dirname').disabled = on; $('rename').disabled = on;
-  $('delupdates').disabled = on;
+  updateControls();
 }
 
 function fillList(el, items) {
@@ -432,16 +464,9 @@ function renderDevice(d) {
     fillList($('updatelist'), d.updates);
   }
 
-  $('fill').disabled = !d.writable || blockedByForeign();
-  $('clean').disabled = d.filler_files === 0;
+  updateControls();
   estimate();
 }
-
-// Guarded rather than merely debounced. Disabling the buttons stops a *click* landing
-// mid-detect, but the folder-name field re-detects on its own timer, and a detect takes
-// longer than the debounce — so two could overlap and the second open would fail for
-// exclusive access. A detect requested during one is folded into a single re-run after.
-let detecting = false, detectAgain = false;
 
 /// One painter for "there is no usable device", so the unplug watcher and a failed
 /// detect can't drift into describing the same state two different ways.
@@ -452,26 +477,24 @@ function showNoDevice(line) {
   $('devinfo').classList.add('hidden');
   $('updatewarn').classList.add('hidden');
   $('elsewhere').classList.add('hidden');
-  $('fill').disabled = true;
-  $('clean').disabled = true;
+  updateControls();
 }
 
 async function refresh() {
   if (detecting) { detectAgain = true; return; }
   detecting = true;
-  // Fill and the remove button open the device themselves, so they must not be live while
-  // a detect holds it.
-  $('refresh').disabled = true;
-  $('fill').disabled = true;
-  $('clean').disabled = true;
+  // Synchronously, before the first await. Fill and the remove button open the device
+  // themselves, so they must not be live while a detect holds it — and a click landing
+  // in the gap before an await resumes is a click on a device that is already busy.
+  updateControls();
   try {
     renderDevice(await invoke('detect', { dirName: dirName() }));
   } catch (e) {
     showNoDevice('No Kindle found');
     log(String(e));
   } finally {
-    $('refresh').disabled = busy;
     detecting = false;
+    updateControls();
     if (detectAgain) { detectAgain = false; refresh(); }
   }
 }
@@ -554,9 +577,7 @@ $('dirname').oninput = () => {
   dirDebounce = setTimeout(applyDirName, 900);
 };
 
-$('overwrite').onchange = () => {
-  $('fill').disabled = !device || !device.writable || blockedByForeign();
-};
+$('overwrite').onchange = updateControls;
 
 // Two clicks rather than a native confirm(). A webview's dialog support is the host's
 // business, not ours, and a confirm() that silently returns falsy would leave this
@@ -611,7 +632,6 @@ $('fill').onclick = async () => {
 };
 
 $('stop').onclick = async () => {
-  $('stop').disabled = true;
   log('Stopping…');
   await invoke('cancel_fill');
 };

@@ -271,7 +271,7 @@ pub async fn list_staged_updates(storage: &Storage) -> Result<Vec<ObjectInfo>, E
 /// list of known model names: the names vary by device generation, and a new one
 /// showing up unrecognized would be the failure that matters. Breadth is safe here
 /// only because nothing is deleted without the user seeing the exact filenames first.
-fn is_staged_update(filename: &str) -> bool {
+pub fn is_staged_update(filename: &str) -> bool {
     let lower = filename.to_ascii_lowercase();
     lower.starts_with(UPDATE_PREFIX) && lower.ends_with(UPDATE_SUFFIX)
 }
@@ -327,7 +327,7 @@ where
 /// `fill_12.bin` and `fill_00000007.bin` — same integer, not a name we would ever
 /// write — without hard-coding a digit count that a long-running resume could
 /// eventually exceed.
-fn filler_sequence(filename: &str) -> Option<u32> {
+pub fn filler_sequence(filename: &str) -> Option<u32> {
     let digits = filename
         .strip_prefix(FILL_PREFIX)?
         .strip_suffix(FILL_SUFFIX)?;
@@ -434,13 +434,27 @@ pub async fn list_foreign(storage: &Storage, dir: ObjectHandle) -> Result<Vec<Ob
 /// folder, or for a listing taken before something else landed in it — not a forged one.
 #[must_use]
 pub fn overwrite_token(dir_name: &str, foreign: &[ObjectInfo]) -> Option<String> {
-    if foreign.is_empty() {
-        return None;
-    }
-    let mut names: Vec<(&str, u64)> = foreign
+    let names: Vec<(&str, u64)> = foreign
         .iter()
         .map(|o| (o.filename.as_str(), o.size))
         .collect();
+    overwrite_token_for_entries(dir_name, names)
+}
+
+/// A fingerprint of a folder's foreign entries, independent of its transport.
+///
+/// MTP exposes foreign files as [`ObjectInfo`], while a Kindle mounted in Finder is
+/// enumerated as normal filesystem entries. Keeping the digest here makes the same
+/// confirmation mean the same thing for both transports.
+#[must_use]
+pub fn overwrite_token_for_entries<'a, I>(dir_name: &str, entries: I) -> Option<String>
+where
+    I: IntoIterator<Item = (&'a str, u64)>,
+{
+    let mut names: Vec<(&str, u64)> = entries.into_iter().collect();
+    if names.is_empty() {
+        return None;
+    }
     // Sorted so the token describes the set, not the order the device happened to
     // list it in — MTP gives no ordering guarantee, and a token that changed between
     // two identical listings would refuse every confirmation.

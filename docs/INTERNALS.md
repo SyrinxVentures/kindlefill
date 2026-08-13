@@ -14,6 +14,11 @@ PTP, so it can't talk to a Kindle; it just stops anything else from doing so. Th
 kills it repeatedly for the duration of a transfer and lets launchd restart it after,
 rather than disabling it permanently and quietly breaking camera import.
 
+Older Kindles use USB mass storage instead. Finder mounts those at `/Volumes/Kindle`;
+the app recognizes that volume only when it also contains the expected `documents`
+directory, then uses normal filesystem operations with the same filler-name and
+overwrite-confirmation rules as the MTP path.
+
 It didn't turn out to be running on the machine this was validated on, so the handling
 is defensive rather than load-bearing — but it costs nothing when idle, and the failure
 it prevents is otherwise a baffling permission error with no obvious cause.

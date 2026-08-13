@@ -10,6 +10,7 @@ description = "Fill a Kindle's MTP storage to a target free-space window, and un
 mtp-rs = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
+libc.workspace = true
 
 [dev-dependencies]
 mtp-rs = { workspace = true, features = ["virtual-device"] }

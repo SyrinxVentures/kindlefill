@@ -130,10 +130,14 @@ jobs:
           fi
           codesign -dv --verbose=4 "$APP" 2>&1 | sed -n '1,8p' || true
 
-      - name: Publish the release (notarized)
+      # Draft, not published: the release goes live only when a person has read the
+      # notes and pressed Publish on GitHub. The generated notes are a starting point
+      # to edit there, never the final word.
+      - name: Draft the release (notarized)
         if: steps.gate.outputs.signed == 'true'
         uses: softprops/action-gh-release@v2
         with:
+          draft: true
           files: target/release/bundle/dmg/*.dmg
           generate_release_notes: true
           body: |
@@ -149,10 +153,11 @@ jobs:
             *Not created or endorsed by Amazon. Kindle and Amazon are trademarks of
             Amazon.com, Inc. or its affiliates.*
 
-      - name: Publish the release (unnotarized fallback)
+      - name: Draft the release (unnotarized fallback)
         if: steps.gate.outputs.signed != 'true'
         uses: softprops/action-gh-release@v2
         with:
+          draft: true
           files: target/release/bundle/dmg/*.dmg
           generate_release_notes: true
           body: |

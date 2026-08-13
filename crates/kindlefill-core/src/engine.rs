@@ -157,6 +157,11 @@ pub enum FillError {
         /// of them can't word the answer differently.
         elsewhere: Vec<FillerFolder>,
     },
+    /// The device answered but did not report its storage capacity, so the free
+    /// figure is a placeholder, not a measurement. The WPD backend reads both
+    /// properties with a default of 0; letting that 0 reach the fill guard produces
+    /// "only 0 bytes free, already below the target" — precise, actionable, wrong.
+    SpaceUnreported,
     /// The requested filler folder name isn't usable.
     BadName(NameError),
     /// The folder no longer holds what the caller was shown when they confirmed
@@ -202,6 +207,12 @@ impl std::fmt::Display for FillError {
                 }
                 Ok(())
             }
+            FillError::SpaceUnreported => write!(
+                f,
+                "the device did not report its storage capacity, so free space \
+                 cannot be measured and nothing can be filled safely. Unlock the \
+                 Kindle's screen, then unplug and replug the cable"
+            ),
             FillError::BadName(e) => write!(f, "{e}"),
             FillError::StaleConfirmation => write!(
                 f,
@@ -907,7 +918,17 @@ impl FillStorage for MtpFill<'_> {
     }
 
     async fn free(&mut self) -> Result<u64, FillError> {
-        Ok(measure(self.storage).await?)
+        let free = measure(self.storage).await?;
+        // The boundary where "not reported" is told apart from "measured as zero":
+        // capacity 0 marks a backend placeholder (WPD reads both properties with
+        // `.unwrap_or(0)`), while free 0 with a real capacity is a genuinely full
+        // device the window logic handles. Only the MTP transport needs this — the
+        // mass-storage sibling measures the filesystem itself, which cannot decline
+        // to answer (statvfs/GetDiskFreeSpaceExW fail loudly instead).
+        if self.storage.info().total_capacity == 0 {
+            return Err(FillError::SpaceUnreported);
+        }
+        Ok(free)
     }
 
     async fn fillers(&mut self) -> Result<Vec<FillerFile<ObjectHandle>>, FillError> {

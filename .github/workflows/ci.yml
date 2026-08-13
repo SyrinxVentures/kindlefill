@@ -10,8 +10,8 @@ on: [push, pull_request]
 jobs:
   check:
     # macOS because it is the platform this is built and used on: the ptpcamerad module
-    # is macOS-only and the app links the system WebKit. Linux and Windows have never
-    # been compiled — see the Platforms section of the README.
+    # is macOS-only and the app links the system WebKit. Windows compiles below;
+    # Linux has never been compiled — see the Platforms section of the README.
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,3 +26,24 @@ jobs:
       # here: it needs a browser, and adding one is a bigger dependency than the three
       # assertions currently justify. It is a manual step, and the README says so
       # rather than letting "CI is green" imply the frontend is covered.
+
+  check-windows:
+    # The same three gates as macOS. Be clear about what green means here: the
+    # test suite drives the engine through mtp-rs's virtual device, which sits on
+    # the PTP-over-USB backend — so this job proves the workspace compiles on
+    # Windows and the planner behaves, and exercises ZERO lines of the WPD backend
+    # a real Kindle would use there. Whether WPD opens a Kindle, reports free
+    # space, and moves it promptly after writes is answerable only by
+    # `kindlefill probe` / `bench` on Windows hardware — the same caveat the
+    # macOS job carries for its own transport, and the same reason the frontend
+    # harness is a named manual step rather than an implied green.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --workspace

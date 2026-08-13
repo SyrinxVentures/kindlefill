@@ -181,17 +181,41 @@ struct DeviceUpdate {
 /// opposite directions — close another program, versus grant this one permission — so
 /// they're kept distinct rather than collapsed into one "device error".
 fn explain(error: &mtp_rs::Error) -> String {
+    // `cfg!` rather than `#[cfg]` arms: every platform's wording stays compiled and
+    // type-checked from every platform, which matters in a repo whose Windows side
+    // can only be cross-checked. The strings differ because the fixes do — naming
+    // ptpcamerad to a Windows user sends them hunting for a daemon they don't have.
     if is_exclusive_access(error) {
-        return "Another program is holding the Kindle. On macOS this is usually \
-                ptpcamerad, Apple's camera daemon; Android File Transfer and OpenMTP \
-                do it too. Quit those and unplug/replug the cable."
-            .to_string();
+        return if cfg!(windows) {
+            // WPD is multi-client, so this is rare on Windows — it means something
+            // claimed the device outside WPD (a WinUSB/libusb tool, a VM grabbing
+            // the USB device), not the usual sync program.
+            "Another program has claimed the Kindle's USB device. Close any \
+             virtualization software or USB tools that may have captured it, then \
+             unplug/replug the cable."
+                .to_string()
+        } else {
+            "Another program is holding the Kindle. On macOS this is usually \
+             ptpcamerad, Apple's camera daemon; Android File Transfer and OpenMTP \
+             do it too. Quit those and unplug/replug the cable."
+                .to_string()
+        };
     }
     if is_permission_denied(error) {
-        return format!(
-            "The system refused access to the device (nothing else is holding it). \
-             On Linux this usually means missing udev rules. Underlying error: {error}"
-        );
+        return if cfg!(windows) {
+            format!(
+                "Windows refused access to the device (nothing else is holding it). \
+                 Unlock the Kindle's screen and replug the cable; if that doesn't \
+                 clear it, check Device Manager — the Kindle should appear under \
+                 Portable Devices. Underlying error: {error}"
+            )
+        } else {
+            format!(
+                "The system refused access to the device (nothing else is holding \
+                 it). On Linux this usually means missing udev rules. Underlying \
+                 error: {error}"
+            )
+        };
     }
     if is_timeout(error) {
         return "The Kindle stopped responding. Its MTP session can end up wedged \
@@ -214,19 +238,29 @@ fn explain(error: &mtp_rs::Error) -> String {
 /// translating differ by transport (there is no ptpcamerad fight over a mounted
 /// volume, but there is an ejected one), so the two keep separate vocabularies.
 fn explain_io(error: &std::io::Error) -> String {
+    // Same `cfg!` reasoning as `explain`: all wordings compile everywhere, and the
+    // file-manager and permission vocabulary is the part that must match the OS.
     match error.kind() {
-        std::io::ErrorKind::NotFound => {
+        std::io::ErrorKind::NotFound => if cfg!(windows) {
+            "The Kindle's drive disappeared — it was ejected or unplugged. Replug \
+             the cable, wait for it to appear in File Explorer, and press Refresh. \
+             Anything already written is intact — Fill again resumes from it."
+        } else {
             "The Kindle's volume disappeared — it was ejected or unplugged. Replug \
              the cable, wait for it to mount in Finder, and press Refresh. Anything \
              already written is intact — Fill again resumes from it."
-                .to_string()
         }
-        std::io::ErrorKind::PermissionDenied => {
+        .to_string(),
+        std::io::ErrorKind::PermissionDenied => if cfg!(windows) {
+            "Windows refused access to the Kindle's drive. Check that the drive \
+             isn't write-protected and that nothing else has its files open, then \
+             try again."
+        } else {
             "macOS refused access to the Kindle's volume. If this is the first run, \
              grant the app access to removable volumes in System Settings → Privacy \
              & Security → Files and Folders, then try again."
-                .to_string()
         }
+        .to_string(),
         _ => format!("{error}"),
     }
 }
@@ -268,13 +302,27 @@ enum Session {
 /// same [`ptpcamerad::Tamer`] the CLI uses — the module used to live inside the CLI
 /// crate, which meant the app could not do this at all despite the README saying the
 /// tool did.
+/// Is an MTP-capable device on the bus, by the same evidence `open_first` acts on?
+///
+/// Two probes because Windows needs both: `list_devices` enumerates over USB only,
+/// and a WPD-bound Kindle is invisible to it — its vendor-class descriptors match
+/// MTP only by an endpoint check that requires the open the WPD driver forbids. The
+/// WPD side asks the same `GetDevices` question the WPD open path acts on, so this
+/// answer and "would `open_first` find something" cannot disagree. One function
+/// rather than two call sites repeating the pair: `device_present` painting the
+/// header and `open_device` choosing a transport must make the identical decision,
+/// or a mounted volume shadows a live Kindle for one of them.
+fn mtp_on_bus() -> bool {
+    MtpDevice::list_devices().is_ok_and(|d| !d.is_empty()) || kindlefill_core::wpd::device_present()
+}
+
 async fn open_device() -> Result<Session, String> {
     // A device actually on the USB bus outranks a mounted volume: `/Volumes/Kindle`
     // with a `documents` folder is also the signature of a backup disk or mounted
     // disk image, and letting it shadow a real MTP Kindle would aim every operation —
     // including confirmed deletions — at the wrong storage. The volume is used only
     // when nothing answers on MTP.
-    let mtp_present = MtpDevice::list_devices().is_ok_and(|d| !d.is_empty());
+    let mtp_present = mtp_on_bus();
     if !mtp_present {
         if let Some(kindle) = MountedKindle::find().map_err(|e| explain_io(&e))? {
             return Ok(Session::Mass(kindle));
@@ -781,14 +829,16 @@ async fn start_clean(
 
 /// Is a device on the bus at all?
 ///
-/// Deliberately not `detect`: this only enumerates USB, so it never opens the Kindle,
-/// never starts a `ptpcamerad` tamer, and is safe to call on a timer. Opening the
-/// device to answer "is the cable still in?" would be both wasteful and impossible
-/// during a fill, which is exactly when the answer matters.
+/// Deliberately not `detect`: this only enumerates — USB descriptors, the WPD device
+/// list, mounted volumes — so it opens no MTP session, starts no `ptpcamerad` tamer,
+/// and is safe to call on a timer. ("Enumerates" with one asterisk: the USB scan's
+/// vendor-class fallback may open the USB device for a descriptor read on macOS —
+/// still no session, and WPD stays multi-client during a fill on Windows.) Opening
+/// the device properly to answer "is the cable still in?" would be both wasteful and
+/// impossible during a fill, which is exactly when the answer matters.
 #[tauri::command]
 fn device_present() -> bool {
-    MountedKindle::find().is_ok_and(|kindle| kindle.is_some())
-        || MtpDevice::list_devices().is_ok_and(|d| !d.is_empty())
+    MountedKindle::find().is_ok_and(|kindle| kindle.is_some()) || mtp_on_bus()
 }
 
 #[tauri::command]

@@ -1,12 +1,15 @@
-//! Kindle USB mass-storage support for older models that Finder mounts directly.
+//! Kindle USB mass-storage support for older models the OS mounts directly.
 //!
-//! Modern Kindles speak MTP; older ones appear as `/Volumes/Kindle`.  The two
-//! transports are deliberately separate, but share the engine's filename and
-//! confirmation rules so cleanup is equally narrow in either mode.
+//! Modern Kindles speak MTP; older ones appear as a volume named `Kindle` —
+//! `/Volumes/Kindle` on macOS, a udisks2 mount point on Linux, a removable drive
+//! letter with that volume label on Windows.  The two transports are deliberately
+//! separate, but share the engine's filename and confirmation rules so cleanup is
+//! equally narrow in either mode.
 
 use crate::engine::{self, CleanReport, DeletedKind, Event, FillError, FillerFolder, Outcome};
 use crate::plan::Window;
 use crate::zeros::CHUNK;
+#[cfg(unix)]
 use std::ffi::CString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -14,7 +17,6 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const VOLUMES: &str = "/Volumes";
 const KINDLE_VOLUME: &str = "Kindle";
 
 /// A root-level entry on a Kindle mounted by macOS.
@@ -32,18 +34,55 @@ pub struct Space {
     pub free: u64,
 }
 
-/// A Kindle exposed by macOS as a USB mass-storage volume.
+/// A Kindle exposed by the OS as a mounted USB mass-storage volume.
 #[derive(Debug, Clone)]
 pub struct MountedKindle {
     root: PathBuf,
 }
 
 impl MountedKindle {
-    /// Find the default, Finder-mounted Kindle volume without considering arbitrary
-    /// removable drives.  The `documents` directory is a second signature: a volume
-    /// merely named Kindle must not become a fill target.
+    /// Find the default, OS-mounted Kindle volume without considering arbitrary
+    /// removable drives.  The `documents` directory is a second signature everywhere:
+    /// a volume merely named Kindle must not become a fill target.
+    ///
+    /// Where "named Kindle" lives differs per OS — a `/Volumes/Kindle` mount point on
+    /// macOS, a udisks2 mount point on Linux, a removable drive's volume *label* on
+    /// Windows — but the two-signature rule is the same on all three.
+    #[cfg(target_os = "macos")]
     pub fn find() -> io::Result<Option<Self>> {
-        Self::find_in(Path::new(VOLUMES))
+        Self::find_in(Path::new("/Volumes"))
+    }
+
+    /// See the macOS `find`. udisks2 mounts removable media under
+    /// `/run/media/<user>/<label>` (Fedora, Arch) or `/media/<user>/<label>` (Debian,
+    /// Ubuntu); both are checked. Untested against hardware — see the README's
+    /// Platforms section.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    pub fn find() -> io::Result<Option<Self>> {
+        let Some(user) = std::env::var_os("USER") else {
+            return Ok(None);
+        };
+        for base in ["/run/media", "/media"] {
+            let candidate = Path::new(base).join(&user);
+            if let Some(kindle) = Self::find_in(&candidate)? {
+                return Ok(Some(kindle));
+            }
+        }
+        Ok(None)
+    }
+
+    /// See the macOS `find`. Windows has no path that encodes the volume name, so
+    /// this walks the removable drive letters and matches the volume *label* against
+    /// `Kindle` — the same first signature the mount-point platforms read from the
+    /// path — then requires `documents` exactly as they do.
+    #[cfg(windows)]
+    pub fn find() -> io::Result<Option<Self>> {
+        for root in windows_impl::removable_drives_labeled(KINDLE_VOLUME) {
+            if root.join("documents").is_dir() {
+                return Ok(Some(Self { root }));
+            }
+        }
+        Ok(None)
     }
 
     pub fn find_in(volumes: &Path) -> io::Result<Option<Self>> {
@@ -60,6 +99,7 @@ impl MountedKindle {
         &self.root
     }
 
+    #[cfg(unix)]
     pub fn space(&self) -> io::Result<Space> {
         let path = CString::new(self.root.as_os_str().as_encoded_bytes())
             .expect("mounted path contains no NUL bytes");
@@ -77,12 +117,31 @@ impl MountedKindle {
         })
     }
 
+    /// The Unix sibling above reports `f_bavail` — bytes available to the caller,
+    /// not raw free blocks — so this reads `GetDiskFreeSpaceExW`'s caller-available
+    /// figure rather than the volume-wide total, keeping the two measurements the
+    /// same quantity.
+    #[cfg(windows)]
+    pub fn space(&self) -> io::Result<Space> {
+        windows_impl::space(&self.root)
+    }
+
+    #[cfg(unix)]
     pub fn is_writable(&self) -> bool {
         let Ok(path) = CString::new(self.root.as_os_str().as_encoded_bytes()) else {
             return false;
         };
         // SAFETY: `path` is NUL-terminated. `access` does not modify the volume.
         unsafe { libc::access(path.as_ptr(), libc::W_OK) == 0 }
+    }
+
+    /// The Unix sibling asks `access(W_OK)`; Windows has no such per-caller probe
+    /// for a FAT volume (there is no owner to check against), so the closest honest
+    /// question is whether the *volume* is writable — its read-only flag, which is
+    /// what a hardware write-protect switch or a `readonly` mount sets.
+    #[cfg(windows)]
+    pub fn is_writable(&self) -> bool {
+        windows_impl::volume_is_writable(&self.root)
     }
 
     pub fn entries(&self, directory: &Path) -> io::Result<Vec<Entry>> {
@@ -474,6 +533,131 @@ fn write_zeros(
     let _ = progress(written);
     file.sync_all()?;
     Ok(true)
+}
+
+/// The Win32 calls behind `MountedKindle`'s Windows arms, kept in one module so the
+/// unsafe surface is a page rather than a scatter.
+#[cfg(windows)]
+mod windows_impl {
+    use super::Space;
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
+    };
+
+    /// `GetDriveTypeW` return value for removable media. Plain `u32` in the Win32
+    /// metadata, so declared here rather than imported as a typed constant.
+    const DRIVE_REMOVABLE: u32 = 2;
+    /// `GetVolumeInformationW` filesystem flag: the volume rejects all writes.
+    const FILE_READ_ONLY_VOLUME: u32 = 0x0008_0000;
+
+    /// A root path as the volume APIs want it: wide, `\`-terminated, NUL-terminated.
+    fn wide_root(root: &Path) -> Vec<u16> {
+        use std::os::windows::ffi::OsStrExt;
+        let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
+        if wide.last() != Some(&u16::from(b'\\')) {
+            wide.push(u16::from(b'\\'));
+        }
+        wide.push(0);
+        wide
+    }
+
+    fn to_io(error: windows::core::Error) -> io::Error {
+        // HRESULTs wrapping a Win32 error (facility 7) unwrap back to the OS code, so
+        // callers classify `NotFound`/`PermissionDenied` exactly as they do on Unix.
+        let code = error.code().0 as u32;
+        if (code >> 16) & 0x7FF == 7 {
+            io::Error::from_raw_os_error((code & 0xFFFF) as i32)
+        } else {
+            io::Error::other(error)
+        }
+    }
+
+    /// Roots of removable drives whose volume label matches `label`.
+    ///
+    /// Removable only: a fixed partition someone labeled Kindle must not become a
+    /// fill target, which is the same narrowness the macOS side gets from only ever
+    /// looking under `/Volumes`. The label compare is case-insensitive because FAT
+    /// stores labels uppercased as often as not, and Windows filesystems are
+    /// case-insensitive everywhere else.
+    pub(super) fn removable_drives_labeled(label: &str) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        // SAFETY: no pointers; returns a bitmask of present drive letters.
+        let mask = unsafe { GetLogicalDrives() };
+        for bit in 0..26u8 {
+            if mask & (1 << bit) == 0 {
+                continue;
+            }
+            let root = format!("{}:\\", char::from(b'A' + bit));
+            let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+            // SAFETY: `wide` is a NUL-terminated root path that outlives both calls.
+            if unsafe { GetDriveTypeW(PCWSTR(wide.as_ptr())) } != DRIVE_REMOVABLE {
+                continue;
+            }
+            // 261: MAX_PATH + NUL, the documented upper bound for a volume name.
+            let mut name = [0u16; 261];
+            // SAFETY: `name` is a writable buffer; the API NUL-terminates into it.
+            let ok = unsafe {
+                GetVolumeInformationW(
+                    PCWSTR(wide.as_ptr()),
+                    Some(&mut name),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            };
+            if ok.is_err() {
+                continue;
+            }
+            let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+            if String::from_utf16_lossy(&name[..len]).eq_ignore_ascii_case(label) {
+                out.push(PathBuf::from(root));
+            }
+        }
+        out
+    }
+
+    pub(super) fn space(root: &Path) -> io::Result<Space> {
+        let wide = wide_root(root);
+        let mut available = 0u64;
+        let mut total = 0u64;
+        // SAFETY: `wide` is NUL-terminated and the out-pointers reference live locals.
+        unsafe {
+            GetDiskFreeSpaceExW(
+                PCWSTR(wide.as_ptr()),
+                Some(&mut available),
+                Some(&mut total),
+                None,
+            )
+        }
+        .map_err(to_io)?;
+        Ok(Space {
+            total,
+            free: available,
+        })
+    }
+
+    pub(super) fn volume_is_writable(root: &Path) -> bool {
+        let wide = wide_root(root);
+        let mut flags = 0u32;
+        // SAFETY: `wide` is NUL-terminated and `flags` is a live local.
+        let ok = unsafe {
+            GetVolumeInformationW(
+                PCWSTR(wide.as_ptr()),
+                None,
+                None,
+                None,
+                Some(&mut flags),
+                None,
+            )
+        };
+        // An unanswerable volume is reported unwritable rather than writable — the
+        // same pessimism `access` failing produces on the Unix side.
+        ok.is_ok() && flags & FILE_READ_ONLY_VOLUME == 0
+    }
 }
 
 #[cfg(test)]

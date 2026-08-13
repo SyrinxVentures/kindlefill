@@ -19,6 +19,7 @@ pub mod mass_storage;
 pub mod plan;
 pub mod ptpcamerad;
 pub mod rate;
+pub mod wpd;
 pub mod zeros;
 
 pub use engine::{

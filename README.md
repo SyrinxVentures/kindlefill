@@ -71,10 +71,25 @@ deletes nothing.
 
 ## Platforms
 
-macOS only, Apple silicon only. That isn't a policy — it's the only configuration this
-has ever been compiled or run on. Windows and Linux are untried rather than unsupported:
-the code carries real affordances for both, and nobody has tested them. The unknown is
-whether `mtp-rs`'s WPD and libusb backends behave like the macOS one.
+**macOS** (Apple silicon) is the platform this is built, released, and validated on.
+
+**Windows** compiles and its test suite runs in CI, and every known platform gap has a
+written-down answer in the code — device presence goes through the WPD device list,
+unreported storage capacity is refused rather than read as "0 bytes free", and
+`cargo tauri build` produces an NSIS installer. What CI green does **not** mean: the
+tests drive the engine through a virtual device on the PTP-over-USB backend, so they
+exercise none of the WPD code a real Kindle uses on Windows. Nobody has yet held a
+Kindle against a Windows build of this; until `kindlefill probe` and `bench` have been
+run there against hardware — in particular, until `bench` shows free space moving
+promptly after each write, which the whole convergence design rests on — treat Windows
+as compiled, not supported. The Windows installer is unsigned, so SmartScreen will warn
+on first run, and installing on a machine without the WebView2 runtime needs a network
+connection (the installer downloads it).
+
+**Linux** compiles untested: volume detection looks under `/run/media/<user>/Kindle`
+and `/media/<user>/Kindle` for mass-storage Kindles, and MTP goes through `mtp-rs`'s
+libusb path, but no Linux machine has ever run this. A report either way is a
+contribution.
 
 Validated against a **Kindle Paperwhite Signature Edition**. Other models should work
 and none have been tried. If you run it against different hardware,

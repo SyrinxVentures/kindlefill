@@ -144,30 +144,50 @@ async fn writable_storage(device: &MtpDevice) -> Result<Storage> {
 }
 
 async fn probe() -> Result<()> {
-    println!("== ptpcamerad ==");
-    match ptpcamerad::probe_privileges() {
-        ptpcamerad::PrivilegeCheck::NotRunning => {
-            println!("  not running (nothing to work around)");
+    // A macOS-only concern gets a macOS-only section: printing "not running
+    // (nothing to work around)" on an OS that never runs the daemon reads as a
+    // check that passed, when no check happened.
+    #[cfg(target_os = "macos")]
+    {
+        println!("== ptpcamerad ==");
+        match ptpcamerad::probe_privileges() {
+            ptpcamerad::PrivilegeCheck::NotRunning => {
+                println!("  not running (nothing to work around)");
+            }
+            ptpcamerad::PrivilegeCheck::KillableUnprivileged => {
+                println!("  running, and killable WITHOUT sudo");
+                println!("  -> the GUI app will not need an admin prompt");
+            }
+            ptpcamerad::PrivilegeCheck::NeedsElevation { reason } => {
+                println!("  running, and NOT killable as this user: {reason}");
+                println!("  -> the GUI app will need an admin prompt or a privileged helper");
+            }
         }
-        ptpcamerad::PrivilegeCheck::KillableUnprivileged => {
-            println!("  running, and killable WITHOUT sudo");
-            println!("  -> the GUI app will not need an admin prompt");
-        }
-        ptpcamerad::PrivilegeCheck::NeedsElevation { reason } => {
-            println!("  running, and NOT killable as this user: {reason}");
-            println!("  -> the GUI app will need an admin prompt or a privileged helper");
-        }
+        println!();
     }
 
-    println!("\n== devices ==");
+    println!("== devices ==");
     match MtpDevice::list_devices() {
-        Ok(devices) if devices.is_empty() => println!("  none found"),
+        // "in the USB scan", not "found": on Windows this enumeration cannot see a
+        // WPD-bound device at all, and a bare "none found" printed one line above a
+        // storages section that then opens a Kindle reads as a contradiction.
+        Ok(devices) if devices.is_empty() => println!("  none in the USB scan"),
         Ok(devices) => {
             for d in &devices {
                 println!("  {}", d.display());
             }
         }
-        Err(e) => println!("  enumeration failed: {e}"),
+        Err(e) => println!("  USB enumeration failed: {e}"),
+    }
+    if cfg!(windows) {
+        // The WPD device list is what `open_first` actually acts on for a Kindle on
+        // Windows — the USB scan above can never show one (matching a vendor-class
+        // Kindle needs an open the WPD driver binding forbids).
+        if kindlefill_core::wpd::device_present() {
+            println!("  WPD: at least one portable device present — the storages section opens it");
+        } else {
+            println!("  WPD: no portable devices");
+        }
     }
 
     println!("\n== storages ==");
@@ -176,14 +196,25 @@ async fn probe() -> Result<()> {
     println!("  device: {} {}", info.manufacturer, info.model);
     for storage in device.storages().await? {
         let s = storage.info();
-        println!(
-            "  {:?}: {} total, {} free, writable={}, fs={:?}",
-            s.description,
-            human_bytes(s.total_capacity),
-            human_bytes(s.free_space),
-            s.is_writable,
-            s.filesystem_type
-        );
+        // Capacity 0 is the backend's placeholder for "the device didn't answer",
+        // not a measurement — printing "0 B free" here would be the same lie the
+        // engine's SpaceUnreported guard exists to refuse.
+        if s.total_capacity == 0 {
+            println!(
+                "  {:?}: capacity/free NOT REPORTED (fill would refuse — unlock the \
+                 device and replug), writable={}, fs={:?}",
+                s.description, s.is_writable, s.filesystem_type
+            );
+        } else {
+            println!(
+                "  {:?}: {} total, {} free, writable={}, fs={:?}",
+                s.description,
+                human_bytes(s.total_capacity),
+                human_bytes(s.free_space),
+                s.is_writable,
+                s.filesystem_type
+            );
+        }
     }
     Ok(())
 }

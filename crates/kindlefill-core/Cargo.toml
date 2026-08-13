@@ -10,7 +10,22 @@ description = "Fill a Kindle's MTP storage to a target free-space window, and un
 mtp-rs = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
+
+# Only the Unix implementations of `MountedKindle::space`/`is_writable` touch libc;
+# an unconditional dependency compiled on Windows only as long as nothing there was
+# actually used.
+[target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+# 0.62 rather than a newer line on purpose: mtp-rs pins =0.62.2, and a second major
+# of `windows` in the tree would compile the largest crate in the graph twice.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_Devices_PortableDevices",
+] }
 
 [dev-dependencies]
 mtp-rs = { workspace = true, features = ["virtual-device"] }

@@ -4,18 +4,15 @@
 //! transports are deliberately separate, but share the engine's filename and
 //! confirmation rules so cleanup is equally narrow in either mode.
 
-use crate::engine::{
-    self, CleanReport, DeletedKind, Event, FillError, FillerFolder, Outcome, PROGRESS_INTERVAL,
-};
-use crate::plan::{next_removal, next_step, Removal, Step, Window};
-use crate::rate::{FillProgress, RateEstimator};
+use crate::engine::{self, CleanReport, DeletedKind, Event, FillError, FillerFolder, Outcome};
+use crate::plan::Window;
 use crate::zeros::CHUNK;
 use std::ffi::CString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 
 const VOLUMES: &str = "/Volumes";
 const KINDLE_VOLUME: &str = "Kindle";
@@ -269,117 +266,27 @@ impl MountedKindle {
         Ok(removed)
     }
 
+    /// The fill itself is `engine::run_fill` — the same loop the MTP transport runs —
+    /// with this volume's filesystem operations behind [`engine::FillStorage`]. The
+    /// adapter's futures never await, so `block_on` drives them without a runtime.
     pub fn fill_with_cancel<F>(
         &self,
         window: Window,
         name: &str,
         cancel: &AtomicBool,
-        mut on_event: F,
+        on_event: F,
     ) -> Result<Outcome, FillError>
     where
-        F: FnMut(Event),
+        F: FnMut(Event) + Send,
     {
         engine::validate_dir_name(name)?;
-        if !self.is_writable() {
-            return Err(FillError::ReadOnly {
-                description: self.root.display().to_string(),
-            });
-        }
-        let start = self.space().map_err(io_error)?.free;
-        if start < window.low() && self.list_fillers(name).map_err(io_error)?.is_empty() {
-            let elsewhere = self
-                .find_filler_folders()
-                .map_err(io_error)?
-                .into_iter()
-                .filter(|f| f.name != name)
-                .collect();
-            return Err(FillError::AlreadyBelowWindow {
-                free: start,
-                low: window.low(),
-                elsewhere,
-            });
-        }
-        let total = start.abs_diff(window.aim());
-        on_event(Event::Started {
-            free: start,
-            aim: window.aim(),
-            total,
-        });
-        let dir = self.ensure_fill_dir(name).map_err(io_error)?;
-        let existing = self.list_fillers(name).map_err(io_error)?;
-        let mut seq = engine::next_sequence(existing.iter().map(|e| e.name.as_str()));
-        let mut rate = RateEstimator::new();
-        let job_start = Instant::now();
-
-        // This loop is a synchronous sibling of `engine::fill_with_cancel`: the shared
-        // decisions (windowing via `next_step`/`next_removal`, names via
-        // `filler_name`/`filler_sequence`/`next_sequence`, pacing via
-        // `PROGRESS_INTERVAL`) all live in the engine, but the loop itself is written
-        // twice because that one is async over MTP primitives and this one is blocking
-        // filesystem I/O. A behavioral change to either loop belongs in both.
-
-        loop {
-            let free = self.space().map_err(io_error)?.free;
-            if cancel.load(Ordering::Acquire) {
-                on_event(Event::Finished { free });
-                return Ok(Outcome::Cancelled { free });
-            }
-            match next_step(free, window) {
-                Step::Done => {
-                    on_event(Event::Finished { free });
-                    return Ok(Outcome::InWindow { free });
-                }
-                Step::Overfilled { free, excess } => {
-                    let fillers = self.list_fillers(name).map_err(io_error)?;
-                    let sizes: Vec<_> = fillers.iter().map(|e| e.bytes).collect();
-                    match next_removal(free, window, &sizes) {
-                        Removal::Remove(index) => {
-                            let victim = &fillers[index];
-                            fs::remove_file(dir.join(&victim.name)).map_err(io_error)?;
-                            on_event(Event::Deleted {
-                                name: victim.name.clone(),
-                                bytes: victim.bytes,
-                                kind: DeletedKind::Filler,
-                            });
-                        }
-                        Removal::Exhausted => {
-                            on_event(Event::Finished { free });
-                            return Ok(Outcome::Overfilled { free, excess });
-                        }
-                    }
-                }
-                Step::Write(bytes) => {
-                    let file_name = engine::filler_name(seq);
-                    let path = dir.join(&file_name);
-                    let committed = total.saturating_sub(free.abs_diff(window.aim()));
-                    let written = write_zeros(&path, bytes, cancel, |done| {
-                        let now = Instant::now();
-                        rate.observe(
-                            committed.saturating_add(done),
-                            now.duration_since(job_start),
-                        );
-                        on_event(Event::Progress(FillProgress {
-                            done: committed.saturating_add(done),
-                            total,
-                            rate: rate.rate(),
-                            eta: rate.eta(total.saturating_sub(committed.saturating_add(done))),
-                        }));
-                    })
-                    .map_err(io_error)?;
-                    if !written {
-                        let free = self.space().map_err(io_error)?.free;
-                        on_event(Event::Finished { free });
-                        return Ok(Outcome::Cancelled { free });
-                    }
-                    seq += 1;
-                    on_event(Event::Wrote {
-                        name: file_name,
-                        bytes,
-                        free: self.space().map_err(io_error)?.free,
-                    });
-                }
-            }
-        }
+        let mut target = MassFill { kindle: self, name };
+        futures::executor::block_on(engine::run_fill(
+            &mut target,
+            window,
+            || cancel.load(Ordering::Acquire),
+            on_event,
+        ))
     }
 
     pub fn clean<F>(&self, name: &str, mut on_event: F) -> Result<CleanReport, FillError>
@@ -425,6 +332,81 @@ fn io_error(error: io::Error) -> FillError {
     FillError::Io(error)
 }
 
+/// [`engine::FillStorage`] over a mounted volume, so [`engine::run_fill`] — the
+/// single owner of the fill's behaviour — drives this transport too. Every method
+/// body is synchronous; the `async` is only the shape the shared loop consumes.
+struct MassFill<'a> {
+    kindle: &'a MountedKindle,
+    name: &'a str,
+}
+
+impl MassFill<'_> {
+    fn dir(&self) -> PathBuf {
+        self.kindle.root.join(self.name)
+    }
+}
+
+impl engine::FillStorage for MassFill<'_> {
+    /// The name alone identifies a filler on a filesystem; there is no handle.
+    type FillerId = ();
+
+    fn check_writable(&self) -> Result<(), FillError> {
+        if self.kindle.is_writable() {
+            Ok(())
+        } else {
+            Err(FillError::ReadOnly {
+                description: self.kindle.root.display().to_string(),
+            })
+        }
+    }
+
+    async fn free(&mut self) -> Result<u64, FillError> {
+        Ok(self.kindle.space().map_err(io_error)?.free)
+    }
+
+    async fn fillers(&mut self) -> Result<Vec<engine::FillerFile<()>>, FillError> {
+        Ok(self
+            .kindle
+            .list_fillers(self.name)
+            .map_err(io_error)?
+            .into_iter()
+            .map(|e| engine::FillerFile {
+                name: e.name,
+                bytes: e.bytes,
+                id: (),
+            })
+            .collect())
+    }
+
+    async fn filler_elsewhere(&mut self) -> Result<Vec<FillerFolder>, FillError> {
+        Ok(self
+            .kindle
+            .find_filler_folders()
+            .map_err(io_error)?
+            .into_iter()
+            .filter(|f| f.name != self.name)
+            .collect())
+    }
+
+    async fn ensure_dir(&mut self) -> Result<(), FillError> {
+        self.kindle.ensure_fill_dir(self.name).map_err(io_error)?;
+        Ok(())
+    }
+
+    async fn delete_filler(&mut self, filler: &engine::FillerFile<()>) -> Result<(), FillError> {
+        fs::remove_file(self.dir().join(&filler.name)).map_err(io_error)
+    }
+
+    async fn write(
+        &mut self,
+        name: &str,
+        bytes: u64,
+        progress: &mut (dyn FnMut(u64) -> ControlFlow<()> + Send),
+    ) -> Result<bool, FillError> {
+        write_zeros(&self.dir().join(name), bytes, progress).map_err(io_error)
+    }
+}
+
 fn purge_children<F>(path: &Path, on_event: &mut F) -> io::Result<usize>
 where
     F: FnMut(Event),
@@ -457,18 +439,24 @@ where
     Ok(removed)
 }
 
-fn write_zeros<F>(path: &Path, bytes: u64, cancel: &AtomicBool, mut progress: F) -> io::Result<bool>
-where
-    F: FnMut(u64),
-{
+/// Write `bytes` zeros to a fresh `path`, reporting every chunk through `progress`.
+///
+/// `progress` is called unthrottled — pacing and cancellation both live in
+/// `run_fill`'s callback, the same as on the MTP transport. A `Break` from it (or an
+/// error) removes the partial file: a leaked partial would consume space no `clean`
+/// run could find. `Ok(false)` means cancelled.
+fn write_zeros(
+    path: &Path,
+    bytes: u64,
+    progress: &mut (dyn FnMut(u64) -> ControlFlow<()> + Send),
+) -> io::Result<bool> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     // Heap, not `[0u8; CHUNK]` on the stack: 1 MiB is half of a worker thread's
     // default stack, and this function runs on whatever thread the app hands it.
     let zeros = vec![0u8; CHUNK];
     let mut written = 0;
-    let mut last_emit: Option<Instant> = None;
     while written < bytes {
-        if cancel.load(Ordering::Acquire) {
+        if progress(written).is_break() {
             drop(file);
             fs::remove_file(path)?;
             return Ok(false);
@@ -480,14 +468,10 @@ where
             return Err(error);
         }
         written += size as u64;
-        let now = Instant::now();
-        if last_emit.is_none_or(|last| now.duration_since(last) >= PROGRESS_INTERVAL)
-            || written == bytes
-        {
-            last_emit = Some(now);
-            progress(written);
-        }
     }
+    // A `Break` here changes nothing — every byte is already written, so the file
+    // is a complete filler either way; report it and finish.
+    let _ = progress(written);
     file.sync_all()?;
     Ok(true)
 }
@@ -524,5 +508,26 @@ mod tests {
         assert_eq!(report.removed, 1);
         assert!(!dir.join("fill_0000.bin").exists());
         assert!(dir.join("fill_notes.bin").exists());
+    }
+
+    /// The mass transport reaches `engine::run_fill` through its adapter: a cancel
+    /// raised before the first step must come back as `Cancelled` — the loop's
+    /// answer, not an error — and must leave no filler behind. (The window bounds
+    /// are irrelevant here; the tempdir sits on a volume with plenty of free space,
+    /// so the loop reaches its cancel check rather than refusing below-window.)
+    #[test]
+    fn a_fill_cancelled_before_the_first_step_writes_nothing() {
+        let (_tmp, kindle) = mounted();
+        let cancel = AtomicBool::new(true);
+        let window = Window::new(50 * 1024 * 1024, 90 * 1024 * 1024).unwrap();
+        let outcome = kindle
+            .fill_with_cancel(window, "fill_disk", &cancel, |_| {})
+            .unwrap();
+        assert!(matches!(outcome, Outcome::Cancelled { .. }));
+        let dir = kindle.root.join("fill_disk");
+        assert!(
+            !dir.exists() || fs::read_dir(&dir).unwrap().next().is_none(),
+            "a cancelled fill left files behind"
+        );
     }
 }

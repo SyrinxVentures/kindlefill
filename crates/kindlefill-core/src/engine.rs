@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 
 /// Fastest we emit [`Event::Progress`]. Uploads report every chunk, which on a 13 GB
 /// fill is thousands of callbacks — more redraws than any UI wants and more IPC than a
-/// Tauri bridge should carry.
-const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+/// Tauri bridge should carry. Public so the mass-storage transport throttles to the
+/// same rate rather than keeping its own copy of this number.
+pub const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Default folder we put filler in. Matches the convention the Kindle modding guides
 /// use, so a folder left by another tool is recognized and topped up rather than
@@ -162,6 +163,11 @@ pub enum FillError {
     /// nobody was ever asked about.
     StaleConfirmation,
     Mtp(Error),
+    /// A filesystem failure on the mass-storage transport. Kept distinct from `Mtp`
+    /// so the front ends can classify it (`PermissionDenied`, a vanished volume) the
+    /// same way they classify MTP failures, instead of a raw errno string — and so a
+    /// filesystem error is never dressed up as an MTP one.
+    Io(std::io::Error),
 }
 
 impl std::fmt::Display for FillError {
@@ -202,6 +208,7 @@ impl std::fmt::Display for FillError {
                  re-check the folder and confirm again"
             ),
             FillError::Mtp(e) => write!(f, "{e}"),
+            FillError::Io(e) => write!(f, "{e}"),
         }
     }
 }
@@ -337,6 +344,18 @@ pub fn filler_sequence(filename: &str) -> Option<u32> {
     }
     let n: u32 = digits.parse().ok()?;
     (format!("{n:04}") == digits).then_some(n)
+}
+
+/// The name written for filler sequence `seq` — the writing half of
+/// [`filler_sequence`], and the only place the format is spelled out.
+///
+/// Public for the same reason `filler_sequence` is: the mass-storage transport writes
+/// the same files, and a second spelling of this format is exactly how the two paths
+/// would diverge — a renamed prefix on one side turns the other side's filler into
+/// files `clean` refuses to touch.
+#[must_use]
+pub fn filler_name(seq: u32) -> String {
+    format!("{FILL_PREFIX}{seq:04}{FILL_SUFFIX}")
 }
 
 /// Filler objects currently in `fill_disk`.
@@ -604,10 +623,17 @@ where
 }
 
 /// Next unused sequence number, so an interrupted run tops up instead of colliding.
-fn next_sequence(existing: &[ObjectInfo]) -> u32 {
+///
+/// Takes names rather than [`ObjectInfo`] for the same reason as
+/// [`overwrite_token_for_entries`]: the mass-storage transport resumes by the same
+/// rule, and this is where that rule lives.
+pub fn next_sequence<'a, I>(existing: I) -> u32
+where
+    I: IntoIterator<Item = &'a str>,
+{
     existing
-        .iter()
-        .filter_map(|o| filler_sequence(&o.filename))
+        .into_iter()
+        .filter_map(filler_sequence)
         .max()
         .map_or(0, |n| n + 1)
 }
@@ -690,7 +716,8 @@ where
     });
 
     let dir = ensure_fill_dir(storage, dir_name).await?;
-    let mut seq = next_sequence(&list_fillers(storage, dir).await?);
+    let existing = list_fillers(storage, dir).await?;
+    let mut seq = next_sequence(existing.iter().map(|o| o.filename.as_str()));
     let mut rate = RateEstimator::new();
     // One clock for the whole job. The rate window spans object boundaries, so it
     // needs a timeline that doesn't restart with each upload.
@@ -732,7 +759,7 @@ where
                 }
             }
             Step::Write(bytes) => {
-                let name = format!("{FILL_PREFIX}{seq:04}{FILL_SUFFIX}");
+                let name = filler_name(seq);
 
                 // Ground truth for everything already committed, taken from the device
                 // rather than from a tally: how much closer to the aim we are than when
@@ -876,27 +903,33 @@ mod tests {
 
     #[test]
     fn sequence_starts_at_zero_on_an_empty_folder() {
-        assert_eq!(next_sequence(&[]), 0);
+        assert_eq!(next_sequence([]), 0);
     }
 
     #[test]
     fn sequence_resumes_after_the_highest_existing_filler() {
-        let existing = vec![
+        let existing = [
             obj("fill_0000.bin"),
             obj("fill_0007.bin"),
             obj("fill_0003.bin"),
         ];
-        assert_eq!(next_sequence(&existing), 8);
+        assert_eq!(
+            next_sequence(existing.iter().map(|o| o.filename.as_str())),
+            8
+        );
     }
 
     #[test]
     fn sequence_ignores_names_this_tool_did_not_write() {
-        let existing = vec![
+        let existing = [
             obj("mybook.azw3"),
             obj("fill_notanumber.bin"),
             obj("fill_.bin"),
         ];
-        assert_eq!(next_sequence(&existing), 0);
+        assert_eq!(
+            next_sequence(existing.iter().map(|o| o.filename.as_str())),
+            0
+        );
     }
 
     /// The `fill_notes.bin` bug was two functions answering "is this ours?"
@@ -911,20 +944,32 @@ mod tests {
     /// like this gets walked around by accident.
     #[test]
     fn only_one_place_decides_whether_a_name_is_filler() {
-        // Relative to the crate root, which is where cargo runs a test binary from,
-        // whether it was invoked at the workspace root or in this directory.
-        let src = std::fs::read_to_string("src/engine.rs").expect("read engine.rs");
-        // Everything above `#[cfg(test)]`, because both needles appear verbatim in the
-        // lines just below and counting those would leave this permanently red.
-        let (module, _) = src
-            .split_once("#[cfg(test)]")
-            .expect("engine.rs has a test module");
-        let sites = module.matches("strip_prefix(FILL_PREFIX)").count()
-            + module.matches(r#"strip_prefix("fill_")"#).count();
-        assert_eq!(
-            sites, 1,
-            "a second site is parsing filler names; extend filler_sequence instead"
-        );
+        // Both transports are checked: the mass-storage module shares
+        // `filler_sequence`/`filler_name`, and this is what keeps a literal copy of
+        // either half from quietly landing there instead.
+        for file in ["src/engine.rs", "src/mass_storage.rs"] {
+            // Relative to the crate root, which is where cargo runs a test binary
+            // from, whether it was invoked at the workspace root or in this directory.
+            let src = std::fs::read_to_string(file).expect("read module source");
+            // Everything above `#[cfg(test)]`, because the needles appear verbatim in
+            // the lines just below and counting those would leave this permanently red.
+            let module = src.split("#[cfg(test)]").next().unwrap();
+            let parse_sites = module.matches("strip_prefix(FILL_PREFIX)").count()
+                + module.matches(r#"strip_prefix("fill_")"#).count();
+            let write_sites = module.matches("format!(\"{FILL_PREFIX}").count()
+                + module.matches(r#"format!("fill_"#).count();
+            let expected = if file.ends_with("engine.rs") {
+                (1, 1)
+            } else {
+                (0, 0)
+            };
+            assert_eq!(
+                (parse_sites, write_sites),
+                expected,
+                "{file}: a second site is parsing or formatting filler names; \
+                 extend filler_sequence/filler_name instead"
+            );
+        }
     }
 
     /// The property that matters for `clean`: a name is ours only if we would write

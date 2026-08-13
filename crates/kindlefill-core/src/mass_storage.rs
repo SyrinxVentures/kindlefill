@@ -4,20 +4,21 @@
 //! transports are deliberately separate, but share the engine's filename and
 //! confirmation rules so cleanup is equally narrow in either mode.
 
-use crate::engine::{self, CleanReport, DeletedKind, Event, FillError, FillerFolder, Outcome};
+use crate::engine::{
+    self, CleanReport, DeletedKind, Event, FillError, FillerFolder, Outcome, PROGRESS_INTERVAL,
+};
 use crate::plan::{next_removal, next_step, Removal, Step, Window};
 use crate::rate::{FillProgress, RateEstimator};
+use crate::zeros::CHUNK;
 use std::ffi::CString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const VOLUMES: &str = "/Volumes";
 const KINDLE_VOLUME: &str = "Kindle";
-const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
-const CHUNK: usize = 1024 * 1024;
 
 /// A root-level entry on a Kindle mounted by macOS.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,7 +92,15 @@ impl MountedKindle {
         let mut entries = Vec::new();
         for child in fs::read_dir(directory)? {
             let child = child?;
-            let meta = child.metadata()?;
+            // `symlink_metadata`, not `metadata`: a symlink must be seen as itself
+            // (and so never as a directory to recurse into or a filler to count),
+            // matching how `purge_children` classifies below. An entry whose stat
+            // fails — deleted between readdir and stat, or unreadable, as macOS's own
+            // `.Trashes` is on non-FAT volumes — is skipped rather than failing the
+            // whole listing: one bad entry must not make the device undetectable.
+            let Ok(meta) = child.path().symlink_metadata() else {
+                continue;
+            };
             let name = child.file_name().to_string_lossy().into_owned();
             entries.push(Entry {
                 name,
@@ -184,7 +193,13 @@ impl MountedKindle {
             if !entry.is_dir || engine::validate_dir_name(&entry.name).is_err() {
                 continue;
             }
-            let fillers = self.list_fillers(&entry.name)?;
+            // A folder this scan can't read (a root-owned `.Trashes`, say — dot
+            // names pass `validate_dir_name`) is treated as holding no filler rather
+            // than failing the sweep: this is advisory breadth, and one unreadable
+            // directory must not turn detect or a completed clean into an error.
+            let Ok(fillers) = self.list_fillers(&entry.name) else {
+                continue;
+            };
             if !fillers.is_empty() {
                 folders.push(FillerFolder {
                     name: entry.name,
@@ -291,15 +306,17 @@ impl MountedKindle {
             total,
         });
         let dir = self.ensure_fill_dir(name).map_err(io_error)?;
-        let mut seq = self
-            .list_fillers(name)
-            .map_err(io_error)?
-            .iter()
-            .filter_map(|e| engine::filler_sequence(&e.name))
-            .max()
-            .map_or(0, |n| n + 1);
+        let existing = self.list_fillers(name).map_err(io_error)?;
+        let mut seq = engine::next_sequence(existing.iter().map(|e| e.name.as_str()));
         let mut rate = RateEstimator::new();
         let job_start = Instant::now();
+
+        // This loop is a synchronous sibling of `engine::fill_with_cancel`: the shared
+        // decisions (windowing via `next_step`/`next_removal`, names via
+        // `filler_name`/`filler_sequence`/`next_sequence`, pacing via
+        // `PROGRESS_INTERVAL`) all live in the engine, but the loop itself is written
+        // twice because that one is async over MTP primitives and this one is blocking
+        // filesystem I/O. A behavioral change to either loop belongs in both.
 
         loop {
             let free = self.space().map_err(io_error)?.free;
@@ -332,7 +349,7 @@ impl MountedKindle {
                     }
                 }
                 Step::Write(bytes) => {
-                    let file_name = format!("fill_{seq:04}.bin");
+                    let file_name = engine::filler_name(seq);
                     let path = dir.join(&file_name);
                     let committed = total.saturating_sub(free.abs_diff(window.aim()));
                     let written = write_zeros(&path, bytes, cancel, |done| {
@@ -405,9 +422,7 @@ impl MountedKindle {
 }
 
 fn io_error(error: io::Error) -> FillError {
-    FillError::Mtp(mtp_rs::Error::Other {
-        detail: error.to_string(),
-    })
+    FillError::Io(error)
 }
 
 fn purge_children<F>(path: &Path, on_event: &mut F) -> io::Result<usize>
@@ -427,7 +442,9 @@ where
             fs::remove_file(child.path())?;
         }
         on_event(Event::Deleted {
-            kind: if !meta.is_dir() && engine::filler_sequence(&name).is_some() {
+            // `is_file()`, not `!is_dir()`: the MTP purge classifies with `is_file`,
+            // and a symlink or socket wearing a filler name is not a file we wrote.
+            kind: if meta.is_file() && engine::filler_sequence(&name).is_some() {
                 DeletedKind::Filler
             } else {
                 DeletedKind::Foreign
@@ -445,7 +462,9 @@ where
     F: FnMut(u64),
 {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    let zeros = [0u8; CHUNK];
+    // Heap, not `[0u8; CHUNK]` on the stack: 1 MiB is half of a worker thread's
+    // default stack, and this function runs on whatever thread the app hands it.
+    let zeros = vec![0u8; CHUNK];
     let mut written = 0;
     let mut last_emit: Option<Instant> = None;
     while written < bytes {

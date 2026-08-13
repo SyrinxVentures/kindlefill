@@ -10,6 +10,7 @@ use crate::plan::{next_removal, next_step, Removal, Step, Window};
 use crate::rate::{FillProgress, RateEstimator};
 use crate::zeros::ZeroStream;
 use mtp_rs::{CancelToken, Error, NewObjectInfo, ObjectHandle, ObjectInfo, Storage};
+use std::future::Future;
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
@@ -657,51 +658,99 @@ where
 
 /// Like [`fill`], but abortable.
 ///
-/// A full fill is a ~17-minute operation on a 32 GB device, so any UI driving it needs
-/// a working Stop button — and one that stops in a second, not at the end of the
-/// current object. Cancellation is therefore checked inside the upload's own progress
-/// callback, not merely between objects: a 1 GiB write is ~40 seconds on its own.
+/// One filler file as [`run_fill`] sees it, whatever the transport. `id` is whatever
+/// the transport needs to delete it — an [`ObjectHandle`] on MTP, nothing on a
+/// mounted volume where the name suffices.
+pub(crate) struct FillerFile<Id> {
+    pub name: String,
+    pub bytes: u64,
+    pub id: Id,
+}
+
+/// One transport's primitives under the shared fill loop.
 ///
-/// Stopping is safe at any point. The half-written object is deleted, everything
-/// already committed stays valid, and a later `fill` resumes from it.
-pub async fn fill_with_cancel<F>(
-    storage: &mut Storage,
+/// [`run_fill`] is written once against this trait; the MTP and mass-storage
+/// transports implement only these operations. The futures are declared `Send`
+/// because the loop runs inside the app's async commands; the mass-storage
+/// implementation's futures are all immediately ready and are driven by `block_on`.
+pub(crate) trait FillStorage {
+    /// Whatever [`Self::delete_filler`] needs to identify one file.
+    type FillerId: Send;
+
+    /// `Err(ReadOnly)` unless the storage can be written.
+    fn check_writable(&self) -> Result<(), FillError>;
+
+    /// Freshly measured free space — never a cached value (see module docs).
+    fn free(&mut self) -> impl Future<Output = Result<u64, FillError>> + Send;
+
+    /// Filler files in the fill folder, sorted by name; empty — not an error — if
+    /// the folder doesn't exist. Must not create the folder: [`run_fill`] asks
+    /// before deciding whether a fill is even legitimate.
+    fn fillers(
+        &mut self,
+    ) -> impl Future<Output = Result<Vec<FillerFile<Self::FillerId>>, FillError>> + Send;
+
+    /// Filler found under root folders *other than* the fill folder, for the
+    /// refusal message when the device is already below the window.
+    fn filler_elsewhere(
+        &mut self,
+    ) -> impl Future<Output = Result<Vec<FillerFolder>, FillError>> + Send;
+
+    /// Create the fill folder if it doesn't exist yet.
+    fn ensure_dir(&mut self) -> impl Future<Output = Result<(), FillError>> + Send;
+
+    fn delete_filler(
+        &mut self,
+        filler: &FillerFile<Self::FillerId>,
+    ) -> impl Future<Output = Result<(), FillError>> + Send;
+
+    /// Write `bytes` zeros as `name` inside the fill folder. `progress` is called
+    /// with the bytes written so far, at least once per chunk, and a `Break` from it
+    /// is a cancellation: the partial file is removed and `Ok(false)` returned. A
+    /// failed write also removes its partial before surfacing the error — a leaked
+    /// partial would consume space no `clean` run could find.
+    fn write(
+        &mut self,
+        name: &str,
+        bytes: u64,
+        progress: &mut (dyn FnMut(u64) -> ControlFlow<()> + Send),
+    ) -> impl Future<Output = Result<bool, FillError>> + Send;
+}
+
+/// The convergence loop, written once for every transport.
+///
+/// This is the single owner of the fill's behaviour: free space re-measured from the
+/// device after every write, progress derived from that measurement rather than a
+/// running tally, one rate clock for the whole job, and the overfilled branch giving
+/// space back via [`next_removal`]. The transports supply only I/O, through
+/// [`FillStorage`].
+///
+/// `cancel` is polled between steps and inside each write's progress callback, so
+/// Stop responds within a chunk rather than at the end of a ~40-second object.
+pub(crate) async fn run_fill<S, C, F>(
+    target: &mut S,
     window: Window,
-    dir_name: &str,
-    cancel: Option<&CancelToken>,
+    cancel: C,
     mut on_event: F,
 ) -> Result<Outcome, FillError>
 where
+    S: FillStorage + Send,
+    C: Fn() -> bool + Send + Sync,
     F: FnMut(Event) + Send,
 {
-    validate_dir_name(dir_name)?;
-    if !storage.info().is_writable {
-        return Err(FillError::ReadOnly {
-            description: storage.info().description.clone(),
-        });
-    }
+    target.check_writable()?;
 
-    let free_start = measure(storage).await?;
-    if free_start < window.low()
-        && match find_fill_dir(storage, dir_name).await? {
-            Some(dir) => list_fillers(storage, dir.handle).await?.is_empty(),
-            None => true,
-        }
-    {
+    let free_start = target.free().await?;
+    if free_start < window.low() && target.fillers().await?.is_empty() {
         // Below the target with no filler of ours *in the folder we were given*. The
         // refusal stands — `fill` manages the folder it was asked about, and going
         // hunting for another one to empty would be exactly the surprise this crate
         // avoids everywhere else. But look before answering, so the message can say
         // where the space went instead of implying it was never ours.
-        let elsewhere = find_filler_folders(storage)
-            .await?
-            .into_iter()
-            .filter(|f| f.name != dir_name)
-            .collect();
         return Err(FillError::AlreadyBelowWindow {
             free: free_start,
             low: window.low(),
-            elsewhere,
+            elsewhere: target.filler_elsewhere().await?,
         });
     }
 
@@ -715,17 +764,17 @@ where
         total,
     });
 
-    let dir = ensure_fill_dir(storage, dir_name).await?;
-    let existing = list_fillers(storage, dir).await?;
-    let mut seq = next_sequence(existing.iter().map(|o| o.filename.as_str()));
+    target.ensure_dir().await?;
+    let existing = target.fillers().await?;
+    let mut seq = next_sequence(existing.iter().map(|f| f.name.as_str()));
     let mut rate = RateEstimator::new();
     // One clock for the whole job. The rate window spans object boundaries, so it
-    // needs a timeline that doesn't restart with each upload.
+    // needs a timeline that doesn't restart with each object.
     let job_start = Instant::now();
 
     loop {
-        let free = measure(storage).await?;
-        if cancel.is_some_and(CancelToken::is_cancelled) {
+        let free = target.free().await?;
+        if cancel() {
             on_event(Event::Finished { free });
             return Ok(Outcome::Cancelled { free });
         }
@@ -738,15 +787,15 @@ where
                 // Below the window: give space back rather than giving up. Only ever
                 // filler this tool wrote, chosen by `next_removal`, and the loop then
                 // re-measures exactly as it does after a write.
-                let fillers = list_fillers(storage, dir).await?;
-                let sizes: Vec<u64> = fillers.iter().map(|f| f.size).collect();
+                let fillers = target.fillers().await?;
+                let sizes: Vec<u64> = fillers.iter().map(|f| f.bytes).collect();
                 match next_removal(free, window, &sizes) {
                     Removal::Remove(i) => {
                         let victim = &fillers[i];
-                        storage.delete(victim.handle).await?;
+                        target.delete_filler(victim).await?;
                         on_event(Event::Deleted {
-                            name: victim.filename.clone(),
-                            bytes: victim.size,
+                            name: victim.name.clone(),
+                            bytes: victim.bytes,
                             kind: DeletedKind::Filler,
                         });
                         continue;
@@ -769,75 +818,203 @@ where
                 // ordinary downward fill.
                 let committed = total.saturating_sub(free.abs_diff(window.aim()));
 
-                let upload = {
-                    let now = Instant::now();
+                let written = {
                     // `None` = nothing emitted for this object yet, so the first
                     // callback always reports. The bar should appear the moment a
                     // write starts rather than after a silent interval.
                     let mut last_emit: Option<Instant> = None;
                     let rate = &mut rate;
                     let on_event = &mut on_event;
-                    let _ = now;
+                    let cancel = &cancel;
 
-                    storage
-                        .upload_with_progress(
-                            Some(dir),
-                            NewObjectInfo::file(&name, bytes),
-                            ZeroStream::new(bytes),
-                            move |p| {
-                                // Checked here rather than only between objects so Stop
-                                // responds within a chunk instead of up to ~40s later.
-                                if cancel.is_some_and(CancelToken::is_cancelled) {
-                                    return ControlFlow::Break(());
-                                }
-                                let now = Instant::now();
-                                let done = committed.saturating_add(p.bytes_transferred);
-                                // Cumulative job bytes against elapsed job time, so the
-                                // estimator can divide across a window that outlives any
-                                // single object — the pauses between them are exactly
-                                // what a throughput figure has to include.
-                                rate.observe(done, now.duration_since(job_start));
+                    let mut progress = move |object_done: u64| {
+                        // Checked here rather than only between objects so Stop
+                        // responds within a chunk instead of up to ~40s later.
+                        if cancel() {
+                            return ControlFlow::Break(());
+                        }
+                        let now = Instant::now();
+                        let done = committed.saturating_add(object_done);
+                        // Cumulative job bytes against elapsed job time, so the
+                        // estimator can divide across a window that outlives any
+                        // single object — the pauses between them are exactly
+                        // what a throughput figure has to include.
+                        rate.observe(done, now.duration_since(job_start));
 
-                                let due = last_emit
-                                    .is_none_or(|t| now.duration_since(t) >= PROGRESS_INTERVAL);
-                                if due {
-                                    last_emit = Some(now);
-                                    on_event(Event::Progress(FillProgress {
-                                        done,
-                                        total,
-                                        rate: rate.rate(),
-                                        eta: rate.eta(total.saturating_sub(done)),
-                                    }));
-                                }
-                                ControlFlow::Continue(())
-                            },
-                        )
-                        .await
+                        let due =
+                            last_emit.is_none_or(|t| now.duration_since(t) >= PROGRESS_INTERVAL);
+                        if due {
+                            last_emit = Some(now);
+                            on_event(Event::Progress(FillProgress {
+                                done,
+                                total,
+                                rate: rate.rate(),
+                                eta: rate.eta(total.saturating_sub(done)),
+                            }));
+                        }
+                        ControlFlow::Continue(())
+                    };
+                    target.write(&name, bytes, &mut progress).await?
                 };
 
-                if let Err(e) = upload {
-                    // A failed data phase can leave a partial object on the device.
-                    // The library deliberately doesn't auto-delete it; if we leaked it,
-                    // it would consume space that no `clean` run could find.
-                    if let Some(partial) = e.partial {
-                        let _ = storage.delete(partial).await;
-                    }
-                    // Breaking out of the progress callback surfaces here as Cancelled.
-                    // That's a deliberate stop, not a failure: the partial object is
-                    // already gone and everything committed before it is still good.
-                    if matches!(e.source, Error::Cancelled) {
-                        let free = measure(storage).await?;
-                        on_event(Event::Finished { free });
-                        return Ok(Outcome::Cancelled { free });
-                    }
-                    return Err(FillError::Mtp(e.source));
+                if !written {
+                    // Breaking out of the progress callback surfaces here as a
+                    // deliberate stop, not a failure: the partial object is already
+                    // gone and everything committed before it is still good.
+                    let free = target.free().await?;
+                    on_event(Event::Finished { free });
+                    return Ok(Outcome::Cancelled { free });
                 }
                 seq += 1;
-                let free = measure(storage).await?;
+                let free = target.free().await?;
                 on_event(Event::Wrote { name, bytes, free });
             }
         }
     }
+}
+
+/// [`FillStorage`] over an MTP [`Storage`].
+struct MtpFill<'a> {
+    storage: &'a mut Storage,
+    dir_name: &'a str,
+    /// Resolved lazily and cached — `fillers` must be able to answer "empty" for a
+    /// folder that doesn't exist without creating it.
+    dir: Option<ObjectHandle>,
+}
+
+impl MtpFill<'_> {
+    async fn find_dir(&mut self) -> Result<Option<ObjectHandle>, FillError> {
+        if self.dir.is_none() {
+            self.dir = find_fill_dir(self.storage, self.dir_name)
+                .await?
+                .map(|d| d.handle);
+        }
+        Ok(self.dir)
+    }
+}
+
+impl FillStorage for MtpFill<'_> {
+    type FillerId = ObjectHandle;
+
+    fn check_writable(&self) -> Result<(), FillError> {
+        if self.storage.info().is_writable {
+            Ok(())
+        } else {
+            Err(FillError::ReadOnly {
+                description: self.storage.info().description.clone(),
+            })
+        }
+    }
+
+    async fn free(&mut self) -> Result<u64, FillError> {
+        Ok(measure(self.storage).await?)
+    }
+
+    async fn fillers(&mut self) -> Result<Vec<FillerFile<ObjectHandle>>, FillError> {
+        let Some(dir) = self.find_dir().await? else {
+            return Ok(Vec::new());
+        };
+        Ok(list_fillers(self.storage, dir)
+            .await?
+            .into_iter()
+            .map(|o| FillerFile {
+                name: o.filename,
+                bytes: o.size,
+                id: o.handle,
+            })
+            .collect())
+    }
+
+    async fn filler_elsewhere(&mut self) -> Result<Vec<FillerFolder>, FillError> {
+        Ok(find_filler_folders(self.storage)
+            .await?
+            .into_iter()
+            .filter(|f| f.name != self.dir_name)
+            .collect())
+    }
+
+    async fn ensure_dir(&mut self) -> Result<(), FillError> {
+        self.dir = Some(ensure_fill_dir(self.storage, self.dir_name).await?);
+        Ok(())
+    }
+
+    async fn delete_filler(&mut self, filler: &FillerFile<ObjectHandle>) -> Result<(), FillError> {
+        Ok(self.storage.delete(filler.id).await?)
+    }
+
+    async fn write(
+        &mut self,
+        name: &str,
+        bytes: u64,
+        progress: &mut (dyn FnMut(u64) -> ControlFlow<()> + Send),
+    ) -> Result<bool, FillError> {
+        let dir = match self.find_dir().await? {
+            Some(dir) => dir,
+            // `run_fill` calls `ensure_dir` first; this is reachable only if the
+            // folder vanished mid-fill, and re-creating it is better than a panic.
+            None => {
+                self.ensure_dir().await?;
+                self.dir.expect("ensure_dir just set it")
+            }
+        };
+        let upload = self
+            .storage
+            .upload_with_progress(
+                Some(dir),
+                NewObjectInfo::file(name, bytes),
+                ZeroStream::new(bytes),
+                |p| progress(p.bytes_transferred),
+            )
+            .await;
+        match upload {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                // A failed data phase can leave a partial object on the device.
+                // The library deliberately doesn't auto-delete it; if we leaked it,
+                // it would consume space that no `clean` run could find.
+                if let Some(partial) = e.partial {
+                    let _ = self.storage.delete(partial).await;
+                }
+                if matches!(e.source, Error::Cancelled) {
+                    Ok(false)
+                } else {
+                    Err(FillError::Mtp(e.source))
+                }
+            }
+        }
+    }
+}
+
+/// A full fill is a ~17-minute operation on a 32 GB device, so any UI driving it needs
+/// a working Stop button — and one that stops in a second, not at the end of the
+/// current object. Cancellation is therefore checked inside the upload's own progress
+/// callback, not merely between objects: a 1 GiB write is ~40 seconds on its own.
+///
+/// Stopping is safe at any point. The half-written object is deleted, everything
+/// already committed stays valid, and a later `fill` resumes from it.
+pub async fn fill_with_cancel<F>(
+    storage: &mut Storage,
+    window: Window,
+    dir_name: &str,
+    cancel: Option<&CancelToken>,
+    on_event: F,
+) -> Result<Outcome, FillError>
+where
+    F: FnMut(Event) + Send,
+{
+    validate_dir_name(dir_name)?;
+    let mut target = MtpFill {
+        storage,
+        dir_name,
+        dir: None,
+    };
+    run_fill(
+        &mut target,
+        window,
+        || cancel.is_some_and(CancelToken::is_cancelled),
+        on_event,
+    )
+    .await
 }
 
 /// Remove every filler object, then the `fill_disk` folder itself.

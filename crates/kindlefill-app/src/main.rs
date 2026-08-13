@@ -13,7 +13,7 @@
 
 use kindlefill_core::{
     engine, human_bytes, human_eta, is_disconnected, is_exclusive_access, is_permission_denied,
-    is_timeout, ptpcamerad, Event, Window,
+    is_timeout, mass_storage::MountedKindle, ptpcamerad, Event, Window,
 };
 use mtp_rs::{CancelToken, MtpDevice, Storage};
 use serde::Serialize;
@@ -228,10 +228,13 @@ fn explain_fill(error: &engine::FillError) -> String {
 /// and so must the `ptpcamerad` tamer, which keeps Apple's camera daemon from
 /// re-claiming the interface partway through a 17-minute transfer. Bundling them means
 /// a caller can't hold one and drop the other.
-struct Session {
-    _device: MtpDevice,
-    _tamer: ptpcamerad::Tamer,
-    storage: Storage,
+enum Session {
+    Mtp {
+        _device: MtpDevice,
+        _tamer: ptpcamerad::Tamer,
+        storage: Storage,
+    },
+    Mass(MountedKindle),
 }
 
 /// Open the Kindle and its writable storage.
@@ -243,6 +246,9 @@ struct Session {
 /// crate, which meant the app could not do this at all despite the README saying the
 /// tool did.
 async fn open_device() -> Result<Session, String> {
+    if let Some(kindle) = MountedKindle::find().map_err(|e| e.to_string())? {
+        return Ok(Session::Mass(kindle));
+    }
     let tamer = ptpcamerad::Tamer::start();
     let device = MtpDevice::open_first().await.map_err(|e| explain(&e))?;
     let storages = device.storages().await.map_err(|e| explain(&e))?;
@@ -250,7 +256,7 @@ async fn open_device() -> Result<Session, String> {
         .into_iter()
         .find(|s| s.info().is_writable)
         .ok_or_else(|| "The device has no writable storage.".to_string())?;
-    Ok(Session {
+    Ok(Session::Mtp {
         _device: device,
         _tamer: tamer,
         storage,
@@ -362,12 +368,7 @@ fn forward(app: &AppHandle, event: Event) {
     }
 }
 
-#[tauri::command]
-async fn detect(state: State<'_, AppState>, dir_name: String) -> Result<DeviceSnapshot, String> {
-    let _op = claim(&state)?;
-    engine::validate_dir_name(&dir_name).map_err(|e| e.to_string())?;
-    let mut session = open_device().await?;
-    let storage = &mut session.storage;
+async fn detect_mtp(storage: &mut Storage, dir_name: String) -> Result<DeviceSnapshot, String> {
     storage.refresh().await.map_err(|e| explain(&e))?;
 
     let (mut filler_files, mut filler_bytes) = (0usize, 0u64);
@@ -438,6 +439,75 @@ async fn detect(state: State<'_, AppState>, dir_name: String) -> Result<DeviceSn
     })
 }
 
+fn named(entry: &kindlefill_core::mass_storage::Entry) -> NamedObject {
+    NamedObject {
+        name: entry.name.clone(),
+        bytes: entry.bytes,
+        human: human_bytes(entry.bytes),
+    }
+}
+
+fn detect_mass(kindle: &MountedKindle, dir_name: String) -> Result<DeviceSnapshot, String> {
+    let space = kindle.space().map_err(|e| e.to_string())?;
+    let fillers = kindle.list_fillers(&dir_name).map_err(|e| e.to_string())?;
+    let foreign = kindle.list_foreign(&dir_name).map_err(|e| e.to_string())?;
+    let filler_bytes = fillers.iter().map(|f| f.bytes).sum();
+    let elsewhere = if fillers.is_empty() {
+        kindle
+            .find_filler_folders()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|f| f.name != dir_name)
+            .map(|f| FillerFolderInfo {
+                name: f.name,
+                files: f.files,
+                bytes: f.bytes,
+                human: human_bytes(f.bytes),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(DeviceSnapshot {
+        model: "Kindle (USB storage)".to_string(),
+        storage: kindle.root().display().to_string(),
+        total: space.total,
+        free: space.free,
+        total_human: human_bytes(space.total),
+        free_human: human_bytes(space.free),
+        writable: kindle.is_writable(),
+        fill_dir: dir_name.clone(),
+        fill_dir_exists: kindle
+            .find_fill_dir(&dir_name)
+            .map_err(|e| e.to_string())?
+            .is_some(),
+        filler_files: fillers.len(),
+        filler_bytes,
+        filler_human: human_bytes(filler_bytes),
+        foreign: foreign.iter().map(named).collect(),
+        overwrite_token: kindle
+            .overwrite_token(&dir_name)
+            .map_err(|e| e.to_string())?,
+        updates: kindle
+            .list_staged_updates()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(named)
+            .collect(),
+        elsewhere,
+    })
+}
+
+#[tauri::command]
+async fn detect(state: State<'_, AppState>, dir_name: String) -> Result<DeviceSnapshot, String> {
+    let _op = claim(&state)?;
+    engine::validate_dir_name(&dir_name).map_err(|e| e.to_string())?;
+    match open_device().await? {
+        Session::Mtp { mut storage, .. } => detect_mtp(&mut storage, dir_name).await,
+        Session::Mass(kindle) => detect_mass(&kindle, dir_name),
+    }
+}
+
 /// Delete staged firmware images the user picked by name.
 ///
 /// The names come from the webview, so they are treated as a request rather than an
@@ -454,17 +524,28 @@ async fn delete_updates(
     if names.is_empty() {
         return Ok("Nothing selected.".to_string());
     }
-    let mut session = open_device().await?;
-    let storage = &mut session.storage;
     let handle = app.clone();
-    let removed = engine::delete_staged_updates(storage, &names, move |ev| forward(&handle, ev))
-        .await
-        .map_err(|e| explain(&e))?;
+    let removed: Vec<NamedObject> = match open_device().await? {
+        Session::Mtp { mut storage, .. } => {
+            engine::delete_staged_updates(&mut storage, &names, move |ev| forward(&handle, ev))
+                .await
+                .map_err(|e| explain(&e))?
+                .iter()
+                .map(NamedObject::from)
+                .collect()
+        }
+        Session::Mass(kindle) => kindle
+            .delete_staged_updates(&names, move |ev| forward(&handle, ev))
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(named)
+            .collect(),
+    };
 
     if removed.is_empty() {
         return Ok("Nothing was deleted — no staged update matched.".to_string());
     }
-    let bytes: u64 = removed.iter().map(|o| o.size).sum();
+    let bytes: u64 = removed.iter().map(|o| o.bytes).sum();
     Ok(format!(
         "Deleted {} staged update{} ({}).",
         removed.len(),
@@ -491,8 +572,7 @@ async fn start_fill(
     let window = Window::new(low, high).map_err(|e| e.to_string())?;
     engine::validate_dir_name(&dir_name).map_err(|e| e.to_string())?;
 
-    let mut session = open_device().await?;
-    let storage = &mut session.storage;
+    let session = open_device().await?;
 
     // Published only once the device is open, not before: a token published ahead of a
     // failed open outlives the command that made it, and Stop then pulls on a token
@@ -514,24 +594,47 @@ async fn start_fill(
     // device before deleting anything. A tick given for one folder therefore cannot be
     // spent on another's contents, and it can't be spent at all on a folder that has
     // changed since it was listed.
-    if let Some(confirmed) = &overwrite {
-        let handle = app.clone();
-        let removed = engine::purge_fill_dir_confirmed(storage, &dir_name, confirmed, move |ev| {
-            forward(&handle, ev)
-        })
-        .await
-        .map_err(|e| explain_fill(&e))?;
-        log(
-            &app,
-            format!("Emptied {dir_name} — {removed} item(s) deleted."),
-        );
-    }
-
-    let handle = app.clone();
-    let outcome = engine::fill_with_cancel(storage, window, &dir_name, Some(&token), move |ev| {
-        forward(&handle, ev)
-    })
-    .await;
+    let outcome = match session {
+        Session::Mtp { mut storage, .. } => {
+            if let Some(confirmed) = &overwrite {
+                let handle = app.clone();
+                let removed = engine::purge_fill_dir_confirmed(
+                    &mut storage,
+                    &dir_name,
+                    confirmed,
+                    move |ev| forward(&handle, ev),
+                )
+                .await
+                .map_err(|e| explain_fill(&e))?;
+                log(
+                    &app,
+                    format!("Emptied {dir_name} — {removed} item(s) deleted."),
+                );
+            }
+            let handle = app.clone();
+            engine::fill_with_cancel(&mut storage, window, &dir_name, Some(&token), move |ev| {
+                forward(&handle, ev)
+            })
+            .await
+            .map_err(|e| explain_fill(&e))?
+        }
+        Session::Mass(kindle) => {
+            if let Some(confirmed) = &overwrite {
+                let handle = app.clone();
+                let removed = kindle
+                    .purge_fill_dir_confirmed(&dir_name, confirmed, move |ev| forward(&handle, ev))
+                    .map_err(|e| explain_fill(&e))?;
+                log(
+                    &app,
+                    format!("Emptied {dir_name} — {removed} item(s) deleted."),
+                );
+            }
+            let handle = app.clone();
+            kindle
+                .fill_with_cancel(window, &dir_name, &flag, move |ev| forward(&handle, ev))
+                .map_err(|e| explain_fill(&e))?
+        }
+    };
 
     // Ours and only ours. Clearing whatever happens to be in the slot is how one
     // command takes away another's Stop button.
@@ -542,7 +645,7 @@ async fn start_fill(
         }
     }
 
-    match outcome.map_err(|e| explain_fill(&e))? {
+    match outcome {
         engine::Outcome::InWindow { free } => Ok(format!(
             "Done — {} free, inside the target window.",
             human_bytes(free)
@@ -571,12 +674,26 @@ async fn start_clean(
 ) -> Result<String, String> {
     let _op = claim(&state)?;
     engine::validate_dir_name(&dir_name).map_err(|e| e.to_string())?;
-    let mut session = open_device().await?;
-    let storage = &mut session.storage;
+    let session = open_device().await?;
     let handle = app.clone();
-    let report = engine::clean(storage, &dir_name, move |ev| forward(&handle, ev))
-        .await
-        .map_err(|e| explain_fill(&e))?;
+    let (report, elsewhere) = match session {
+        Session::Mtp { mut storage, .. } => {
+            let report = engine::clean(&mut storage, &dir_name, move |ev| forward(&handle, ev))
+                .await
+                .map_err(|e| explain_fill(&e))?;
+            let elsewhere = engine::find_filler_folders(&storage)
+                .await
+                .map_err(|e| explain(&e))?;
+            (report, elsewhere)
+        }
+        Session::Mass(kindle) => {
+            let report = kindle
+                .clean(&dir_name, move |ev| forward(&handle, ev))
+                .map_err(|e| explain_fill(&e))?;
+            let elsewhere = kindle.find_filler_folders().map_err(|e| e.to_string())?;
+            (report, elsewhere)
+        }
+    };
 
     if report.removed > 0 {
         return Ok(format!(
@@ -589,10 +706,7 @@ async fn start_clean(
     }
     // Deleting nothing and reporting success is how someone concludes their device is
     // clean while gigabytes of filler sit in a folder under another name. Say where.
-    let others = engine::find_filler_folders(storage)
-        .await
-        .map_err(|e| explain(&e))?;
-    match others.iter().find(|f| f.name != dir_name) {
+    match elsewhere.iter().find(|f| f.name != dir_name) {
         Some(f) => Ok(format!(
             "Nothing to remove in {dir_name}, but {} of filler is in {} — switch to \
              that folder and try again.",
@@ -614,7 +728,8 @@ async fn start_clean(
 /// during a fill, which is exactly when the answer matters.
 #[tauri::command]
 fn device_present() -> bool {
-    MtpDevice::list_devices().is_ok_and(|d| !d.is_empty())
+    MountedKindle::find().is_ok_and(|kindle| kindle.is_some())
+        || MtpDevice::list_devices().is_ok_and(|d| !d.is_empty())
 }
 
 #[tauri::command]

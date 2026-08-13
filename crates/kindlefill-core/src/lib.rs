@@ -15,6 +15,7 @@
 //! I/O error.
 
 pub mod engine;
+pub mod mass_storage;
 pub mod plan;
 pub mod ptpcamerad;
 pub mod rate;
@@ -23,8 +24,8 @@ pub mod zeros;
 pub use engine::{
     clean, current_overwrite_token, delete_staged_updates, fill, fill_with_cancel, find_fill_dir,
     find_filler_folders, list_fillers, list_foreign, list_staged_updates, overwrite_token,
-    purge_fill_dir, purge_fill_dir_confirmed, validate_dir_name, CleanReport, DeletedKind, Event,
-    FillError, FillerFolder, NameError, Outcome, DEFAULT_FILL_DIR,
+    overwrite_token_for_entries, purge_fill_dir, purge_fill_dir_confirmed, validate_dir_name,
+    CleanReport, DeletedKind, Event, FillError, FillerFolder, NameError, Outcome, DEFAULT_FILL_DIR,
 };
 pub use plan::{next_removal, next_step, Removal, Step, Window, WindowError, GIB, KIB, MIB};
 pub use rate::{human_duration, human_eta, FillProgress, RateEstimator};

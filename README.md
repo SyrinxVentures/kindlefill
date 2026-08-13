@@ -3,8 +3,9 @@
 Fills a Kindle's storage down to a target free-space window (default 50–90 MB) so the
 device can't download an OTA firmware update, and removes the filler again afterwards.
 
-Targets modern MTP Kindles (11th gen and newer — 2024 Paperwhite, Colorsoft, Scribe,
-basic 2024), which no longer mount as USB mass storage.
+Targets both modern MTP Kindles (11th gen and newer — 2024 Paperwhite, Colorsoft,
+Scribe, basic 2024) and older models that Finder mounts as a USB volume named
+`Kindle`.
 
 > **Not created or endorsed by Amazon.** KindleFill is an independent, free, open-source
 > tool. *Kindle* and *Amazon* are trademarks of Amazon.com, Inc. or its affiliates, used

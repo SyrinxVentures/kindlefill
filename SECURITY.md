@@ -33,9 +33,11 @@ that would genuinely matter:
   connect and can't talk to a Kindle, so nothing else can either until it lets go. launchd
   restarts it within a second, and the taming is scoped to the operation rather than
   disabling the daemon permanently.
-- **The released DMG is ad-hoc signed, not notarized.** Downloads are quarantined and take
-  an extra step to open, described in the README. Notarization needs a paid Apple
-  Developer account.
+- **An unnotarized release is possible, and says so.** Released DMGs are normally signed
+  with a Developer ID and notarized. If the signing credentials are missing, the workflow
+  still publishes a working DMG — CI checks whether the bundle is actually notarized and
+  the release notes for that build state that it is not, so macOS quarantine on such a
+  download is expected rather than a defect. See [Releasing](docs/RELEASING.md).
 - **The frontend can send any string to the backend.** It is in-process; there is no trust
   boundary there. Backend checks exist to catch a frontend driven into a bad state, not an
   adversary.

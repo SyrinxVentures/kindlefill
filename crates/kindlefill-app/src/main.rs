@@ -209,6 +209,28 @@ fn explain(error: &mtp_rs::Error) -> String {
     format!("{error}")
 }
 
+/// [`explain`] for the mass-storage transport, where failures are plain filesystem
+/// errors rather than MTP ones. Same job, sibling function: the conditions worth
+/// translating differ by transport (there is no ptpcamerad fight over a mounted
+/// volume, but there is an ejected one), so the two keep separate vocabularies.
+fn explain_io(error: &std::io::Error) -> String {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => {
+            "The Kindle's volume disappeared — it was ejected or unplugged. Replug \
+             the cable, wait for it to mount in Finder, and press Refresh. Anything \
+             already written is intact — Fill again resumes from it."
+                .to_string()
+        }
+        std::io::ErrorKind::PermissionDenied => {
+            "macOS refused access to the Kindle's volume. If this is the first run, \
+             grant the app access to removable volumes in System Settings → Privacy \
+             & Security → Files and Folders, then try again."
+                .to_string()
+        }
+        _ => format!("{error}"),
+    }
+}
+
 /// [`explain`] for the engine's own error type.
 ///
 /// A fill or clean that fails because something else holds the device deserves the same
@@ -218,6 +240,7 @@ fn explain(error: &mtp_rs::Error) -> String {
 fn explain_fill(error: &engine::FillError) -> String {
     match error {
         engine::FillError::Mtp(e) => explain(e),
+        engine::FillError::Io(e) => explain_io(e),
         other => other.to_string(),
     }
 }
@@ -246,8 +269,16 @@ enum Session {
 /// crate, which meant the app could not do this at all despite the README saying the
 /// tool did.
 async fn open_device() -> Result<Session, String> {
-    if let Some(kindle) = MountedKindle::find().map_err(|e| e.to_string())? {
-        return Ok(Session::Mass(kindle));
+    // A device actually on the USB bus outranks a mounted volume: `/Volumes/Kindle`
+    // with a `documents` folder is also the signature of a backup disk or mounted
+    // disk image, and letting it shadow a real MTP Kindle would aim every operation —
+    // including confirmed deletions — at the wrong storage. The volume is used only
+    // when nothing answers on MTP.
+    let mtp_present = MtpDevice::list_devices().is_ok_and(|d| !d.is_empty());
+    if !mtp_present {
+        if let Some(kindle) = MountedKindle::find().map_err(|e| explain_io(&e))? {
+            return Ok(Session::Mass(kindle));
+        }
     }
     let tamer = ptpcamerad::Tamer::start();
     let device = MtpDevice::open_first().await.map_err(|e| explain(&e))?;
@@ -448,14 +479,14 @@ fn named(entry: &kindlefill_core::mass_storage::Entry) -> NamedObject {
 }
 
 fn detect_mass(kindle: &MountedKindle, dir_name: String) -> Result<DeviceSnapshot, String> {
-    let space = kindle.space().map_err(|e| e.to_string())?;
-    let fillers = kindle.list_fillers(&dir_name).map_err(|e| e.to_string())?;
-    let foreign = kindle.list_foreign(&dir_name).map_err(|e| e.to_string())?;
+    let space = kindle.space().map_err(|e| explain_io(&e))?;
+    let fillers = kindle.list_fillers(&dir_name).map_err(|e| explain_io(&e))?;
+    let foreign = kindle.list_foreign(&dir_name).map_err(|e| explain_io(&e))?;
     let filler_bytes = fillers.iter().map(|f| f.bytes).sum();
     let elsewhere = if fillers.is_empty() {
         kindle
             .find_filler_folders()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| explain_io(&e))?
             .into_iter()
             .filter(|f| f.name != dir_name)
             .map(|f| FillerFolderInfo {
@@ -479,18 +510,23 @@ fn detect_mass(kindle: &MountedKindle, dir_name: String) -> Result<DeviceSnapsho
         fill_dir: dir_name.clone(),
         fill_dir_exists: kindle
             .find_fill_dir(&dir_name)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| explain_io(&e))?
             .is_some(),
         filler_files: fillers.len(),
         filler_bytes,
         filler_human: human_bytes(filler_bytes),
+        // The token is derived from the same `foreign` listing rendered above — not
+        // from `kindle.overwrite_token()`, which re-reads the directory and could
+        // fingerprint a set the user never saw. Same rule as `detect_mtp`: the token
+        // stands for exactly the names on screen.
+        overwrite_token: engine::overwrite_token_for_entries(
+            &dir_name,
+            foreign.iter().map(|e| (e.name.as_str(), e.bytes)),
+        ),
         foreign: foreign.iter().map(named).collect(),
-        overwrite_token: kindle
-            .overwrite_token(&dir_name)
-            .map_err(|e| e.to_string())?,
         updates: kindle
             .list_staged_updates()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| explain_io(&e))?
             .iter()
             .map(named)
             .collect(),
@@ -536,7 +572,7 @@ async fn delete_updates(
         }
         Session::Mass(kindle) => kindle
             .delete_staged_updates(&names, move |ev| forward(&handle, ev))
-            .map_err(|e| e.to_string())?
+            .map_err(|e| explain_io(&e))?
             .iter()
             .map(named)
             .collect(),
@@ -594,45 +630,67 @@ async fn start_fill(
     // device before deleting anything. A tick given for one folder therefore cannot be
     // spent on another's contents, and it can't be spent at all on a folder that has
     // changed since it was listed.
-    let outcome = match session {
+    // Held as a `Result` rather than `?`-propagated: an early return here would skip
+    // the clearing block below and leave the published flag pointing at a fill that
+    // no longer exists — the Stop button then pulls on a token nothing is watching,
+    // which is the exact failure the publish ordering above exists to prevent.
+    let result: Result<engine::Outcome, String> = match session {
         Session::Mtp { mut storage, .. } => {
-            if let Some(confirmed) = &overwrite {
-                let handle = app.clone();
-                let removed = engine::purge_fill_dir_confirmed(
-                    &mut storage,
-                    &dir_name,
-                    confirmed,
-                    move |ev| forward(&handle, ev),
-                )
+            let purge = app.clone();
+            let fill = app.clone();
+            async {
+                if let Some(confirmed) = &overwrite {
+                    let handle = purge.clone();
+                    let removed = engine::purge_fill_dir_confirmed(
+                        &mut storage,
+                        &dir_name,
+                        confirmed,
+                        move |ev| forward(&handle, ev),
+                    )
+                    .await
+                    .map_err(|e| explain_fill(&e))?;
+                    log(
+                        &purge,
+                        format!("Emptied {dir_name} — {removed} item(s) deleted."),
+                    );
+                }
+                let handle = fill.clone();
+                engine::fill_with_cancel(&mut storage, window, &dir_name, Some(&token), move |ev| {
+                    forward(&handle, ev)
+                })
                 .await
-                .map_err(|e| explain_fill(&e))?;
-                log(
-                    &app,
-                    format!("Emptied {dir_name} — {removed} item(s) deleted."),
-                );
+                .map_err(|e| explain_fill(&e))
             }
-            let handle = app.clone();
-            engine::fill_with_cancel(&mut storage, window, &dir_name, Some(&token), move |ev| {
-                forward(&handle, ev)
-            })
             .await
-            .map_err(|e| explain_fill(&e))?
         }
         Session::Mass(kindle) => {
-            if let Some(confirmed) = &overwrite {
-                let handle = app.clone();
-                let removed = kindle
-                    .purge_fill_dir_confirmed(&dir_name, confirmed, move |ev| forward(&handle, ev))
-                    .map_err(|e| explain_fill(&e))?;
-                log(
-                    &app,
-                    format!("Emptied {dir_name} — {removed} item(s) deleted."),
-                );
-            }
-            let handle = app.clone();
-            kindle
-                .fill_with_cancel(window, &dir_name, &flag, move |ev| forward(&handle, ev))
-                .map_err(|e| explain_fill(&e))?
+            // The mass path is blocking filesystem I/O; a multi-gigabyte fill run
+            // inline would pin one of the runtime's worker threads for its whole
+            // duration. `spawn_blocking` gives it a thread that's allowed to block —
+            // the MTP arm above needs none of this because its transfers await.
+            let purge_app = app.clone();
+            let fill_app = app.clone();
+            let dir = dir_name.clone();
+            let overwrite = overwrite.clone();
+            let fill_flag = flag.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Some(confirmed) = &overwrite {
+                    let handle = purge_app.clone();
+                    let removed = kindle
+                        .purge_fill_dir_confirmed(&dir, confirmed, move |ev| forward(&handle, ev))
+                        .map_err(|e| explain_fill(&e))?;
+                    log(
+                        &purge_app,
+                        format!("Emptied {dir} — {removed} item(s) deleted."),
+                    );
+                }
+                let handle = fill_app.clone();
+                kindle
+                    .fill_with_cancel(window, &dir, &fill_flag, move |ev| forward(&handle, ev))
+                    .map_err(|e| explain_fill(&e))
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("the fill task failed: {e}")))
         }
     };
 
@@ -645,7 +703,7 @@ async fn start_fill(
         }
     }
 
-    match outcome {
+    match result? {
         engine::Outcome::InWindow { free } => Ok(format!(
             "Done — {} free, inside the target window.",
             human_bytes(free)
@@ -674,25 +732,17 @@ async fn start_clean(
 ) -> Result<String, String> {
     let _op = claim(&state)?;
     engine::validate_dir_name(&dir_name).map_err(|e| e.to_string())?;
-    let session = open_device().await?;
+    let mut session = open_device().await?;
     let handle = app.clone();
-    let (report, elsewhere) = match session {
-        Session::Mtp { mut storage, .. } => {
-            let report = engine::clean(&mut storage, &dir_name, move |ev| forward(&handle, ev))
+    let report = match &mut session {
+        Session::Mtp { storage, .. } => {
+            engine::clean(storage, &dir_name, move |ev| forward(&handle, ev))
                 .await
-                .map_err(|e| explain_fill(&e))?;
-            let elsewhere = engine::find_filler_folders(&storage)
-                .await
-                .map_err(|e| explain(&e))?;
-            (report, elsewhere)
+                .map_err(|e| explain_fill(&e))?
         }
-        Session::Mass(kindle) => {
-            let report = kindle
-                .clean(&dir_name, move |ev| forward(&handle, ev))
-                .map_err(|e| explain_fill(&e))?;
-            let elsewhere = kindle.find_filler_folders().map_err(|e| e.to_string())?;
-            (report, elsewhere)
-        }
+        Session::Mass(kindle) => kindle
+            .clean(&dir_name, move |ev| forward(&handle, ev))
+            .map_err(|e| explain_fill(&e))?,
     };
 
     if report.removed > 0 {
@@ -706,6 +756,15 @@ async fn start_clean(
     }
     // Deleting nothing and reporting success is how someone concludes their device is
     // clean while gigabytes of filler sit in a folder under another name. Say where.
+    // Scanned only on that empty-handed path: the sweep costs a listing per root
+    // folder, and a failure in it must not turn a clean that already succeeded into
+    // a reported error.
+    let elsewhere = match &session {
+        Session::Mtp { storage, .. } => engine::find_filler_folders(storage)
+            .await
+            .map_err(|e| explain(&e))?,
+        Session::Mass(kindle) => kindle.find_filler_folders().map_err(|e| explain_io(&e))?,
+    };
     match elsewhere.iter().find(|f| f.name != dir_name) {
         Some(f) => Ok(format!(
             "Nothing to remove in {dir_name}, but {} of filler is in {} — switch to \

@@ -19,7 +19,8 @@ use std::task::{Context, Poll};
 
 /// How much we hand the transport per poll. Large enough that per-chunk bookkeeping
 /// is noise against USB transfer time, small enough to stay responsive to cancellation.
-const CHUNK: usize = 1024 * 1024;
+/// Public so the mass-storage writer uses the same trade-off rather than its own copy.
+pub const CHUNK: usize = 1024 * 1024;
 
 /// Yields `len` zero bytes, then ends.
 ///

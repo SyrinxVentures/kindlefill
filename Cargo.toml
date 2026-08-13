@@ -3,7 +3,7 @@ members = ["crates/kindlefill-core", "crates/kindlefill-cli", "crates/kindlefill
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # Matches mtp-rs and the Rust ecosystem default. Apache-2.0 carries the explicit
 # patent grant; MIT is the shorter, more universally recognized option. Downstream

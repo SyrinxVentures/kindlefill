@@ -1,18 +1,21 @@
 # Contributing
 
 The most valuable contribution to this project is not code. It is a report from a Kindle
-that isn't a Paperwhite Signature Edition on macOS, because that is the only device and
-platform this has ever run on.
+that isn't a Paperwhite Signature Edition or an Oasis (10th generation) on macOS, because
+those are the only two devices, and macOS the only platform, this has ever run on.
 
 ## The most useful thing you can do
 
 Run it and say what happened. Especially:
 
 - **A different Kindle model.** Does it enumerate? Does reported free space actually move
-  after a write? `cargo run -p kindlefill-cli -- bench` answers both and prints the
-  numbers to paste into an issue.
-- **Windows or Linux.** Neither has ever been compiled. The unknown isn't this code, it's
-  whether `mtp-rs`'s WPD and libusb backends behave like the macOS one.
+  after a write? On an MTP Kindle (11th gen and newer),
+  `cargo run -p kindlefill-cli -- bench` answers both and prints the numbers to paste into
+  an issue. `bench` opens an MTP device, so on an older Kindle that mounts as a `Kindle`
+  volume, `status` plus a fill and a cleanup is the report to send instead.
+- **Windows or Linux.** Both compile; neither has ever been run against a Kindle. The
+  unknown isn't this code, it's whether `mtp-rs`'s WPD and libusb backends behave like the
+  macOS one — and, on Windows, whether the mass-storage volume is found at all.
 - **The three paths never exercised on hardware** — `ptpcamerad` taming, deleting a staged
   firmware update, and Overwrite. They are covered by tests against a virtual device,
   which is not the same thing.

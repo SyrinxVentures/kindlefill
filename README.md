@@ -91,8 +91,10 @@ and `/media/<user>/Kindle` for mass-storage Kindles, and MTP goes through `mtp-r
 libusb path, but no Linux machine has ever run this. A report either way is a
 contribution.
 
-Validated against a **Kindle Paperwhite Signature Edition**. Other models should work
-and none have been tried. If you run it against different hardware,
+Validated on macOS against two devices, one per transport: a **Kindle Paperwhite
+Signature Edition** over MTP, and a **Kindle Oasis (10th generation)** as a Finder volume
+— fill, Stop, resume, and Remove filler & folder all ran on both. Other models should
+work and none have been tried. If you run it against different hardware,
 [an issue saying what happened](https://github.com/SyrinxVentures/kindlefill/issues) —
 good or bad — is the most useful thing you could contribute.
 

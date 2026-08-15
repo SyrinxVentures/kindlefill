@@ -17,10 +17,11 @@ rather than disabling it permanently and quietly breaking camera import.
 Older Kindles use USB mass storage instead. Finder mounts those at `/Volumes/Kindle`;
 the app recognizes that volume only when it also contains the expected `documents`
 directory, then uses normal filesystem operations with the same filler-name and
-overwrite-confirmation rules as the MTP path.
+overwrite-confirmation rules as the MTP path. This path has been run against an Oasis
+(10th generation) — see [Status](#status).
 
-It didn't turn out to be running on the machine this was validated on, so the handling
-is defensive rather than load-bearing — but it costs nothing when idle, and the failure
+`ptpcamerad` didn't turn out to be running on the machine this was validated on, so that
+handling is defensive rather than load-bearing — but it costs nothing when idle, and the failure
 it prevents is otherwise a baffling permission error with no obvious cause.
 
 **Fill converges from either side.** Writing can only ever reduce free space, so a
@@ -55,8 +56,12 @@ streams them straight into the upload, so the host never stores a byte.
 
 ## Status
 
-Validated against a **Kindle Paperwhite Signature Edition** (25.46 GB usable) on macOS.
-Every assumption the design rested on held:
+Validated on macOS against one device per transport: a **Kindle Paperwhite Signature
+Edition** (25.46 GB usable) over MTP, and a **Kindle Oasis (10th generation)** as a
+mass-storage volume.
+
+The MTP measurements below come from the Paperwhite. Every assumption the design rested
+on held:
 
 | Question | Answer |
 |---|---|
@@ -74,7 +79,7 @@ measure-write-remeasure loop unable to converge, and it would have passed every 
 this repo before failing on the cable. It doesn't cache. The stray 4 KB block is exactly
 the kind of overhead the loop absorbs by measuring instead of tallying.
 
-The GUI has since been run against the same device, driven end to end:
+The GUI has since been run against the same Paperwhite, driven end to end:
 
 | Check | Result |
 |---|---|
@@ -88,6 +93,14 @@ The GUI has since been run against the same device, driven end to end:
 Those runs used a window shifted ~2.5 GB below current free space rather than the
 50–90 MB default. Same code path — the ladder still lays down 1 GiB objects, so Stop is
 still tested mid-object — without parking the device at 70 MB free for the duration.
+
+**The mass-storage path has since been exercised too**, with the Mac app against a
+**Kindle Oasis (10th generation)** — the older USB-volume transport rather than MTP.
+Detection, fill, Stop, resume, and Remove filler & folder all behaved as they do over
+MTP. There are no `bench` numbers for it: `bench` opens an MTP device, so it doesn't run
+on a mass-storage Kindle at all. The question it exists to answer doesn't arise there
+either — free space comes from `statvfs` on a mounted filesystem, not from a device
+answering a cacheable `GetStorageInfo`.
 
 Three paths have *not* been exercised on hardware and rest on the test suite alone —
 see [What has and hasn't been exercised on hardware](#what-has-and-hasnt-been-exercised-on-hardware).
@@ -167,19 +180,25 @@ shouldn't be read as if it does.
 ## What has and hasn't been exercised on hardware
 
 Fill, Stop, resume, and Remove filler & folder have all been run against a Paperwhite Signature
-Edition (see Status). Three paths have not, and are covered only by the test suite:
+Edition over MTP and an Oasis (10th generation) as a mass-storage volume (see Status), so
+both transports have carried a real fill and a real cleanup. Three paths have not, and are
+covered only by the test suite:
 
-- **`ptpcamerad` taming** — the daemon wasn't running on the test machine.
-- **Deleting a staged firmware update** — no update was staged on the test device.
-- **Overwrite** — the test folder never held foreign content.
+- **`ptpcamerad` taming** — the daemon wasn't running on the test machine. It is an MTP
+  concern by construction: the mass-storage path opens no MTP session, so the Oasis run
+  couldn't exercise it either.
+- **Deleting a staged firmware update** — no update was staged on either device.
+- **Overwrite** — neither test folder ever held foreign content.
 
-Two more caveats, both about *when* those runs happened. They were made against an
-earlier build, before the interface was reworked — the capacity bar, the terminal
-progress state, the armed-overwrite button and the range guards have been exercised
-against a stubbed backend in a browser and by the test suites, but not against a Kindle.
-And the released bundle itself has not been launched: its contents are verified by
-decompressing the embedded frontend and by 68 Rust tests, which is not the same as
-double-clicking it.
+One caveat remains, and it is about *when* those runs happened. The Paperwhite runs were
+made against an earlier build, before the interface was reworked, so the capacity bar,
+the terminal progress state, the armed-overwrite button and the range guards have never
+been driven over MTP against a Kindle — only against a stubbed backend in a browser and
+by the test suites.
+
+The Oasis run closes the other half of that gap: it used the released 0.2.0 `.dmg`, so
+the shipped bundle has been double-clicked and the reworked interface has driven a real
+fill — on the mass-storage path.
 
 If you run it against real hardware, an issue saying what happened — good or bad — is
 the single most useful thing you could contribute.

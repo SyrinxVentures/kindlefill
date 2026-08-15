@@ -1,0 +1,20 @@
+# One identity for this org's commits, without rewriting history.
+#
+# Commits here were made from machines whose git identity had never been set, so
+# they carry a hostname-derived address (`user@some-mac.local`, or a Tailscale
+# name) that resolves nowhere and links to no account. A few carry a personal or
+# GitHub noreply address instead. Correcting that in the commits themselves would
+# change every SHA and break every existing clone, fork and permalink, so it is
+# corrected for display here: `git log`, `git shortlog` and most tooling read
+# this file, and the objects are untouched.
+#
+# Only identities confirmed to be the same person are listed. Other contributors
+# keep their own, whatever shape it is in.
+
+Andre Vrignaud <developer@syrinxventures.com> <6832900+avrignaud@users.noreply.github.com>
+Andre Vrignaud <developer@syrinxventures.com> <avrignaud@users.noreply.github.com>
+Andre Vrignaud <developer@syrinxventures.com> <andre@ozymandi.as>
+Andre Vrignaud <developer@syrinxventures.com> <andrevrignaud@phoenix-mac-mini.local>
+Andre Vrignaud <developer@syrinxventures.com> <andrevrignaud@phoenix-mac-mini.skink-velociraptor.ts.net>
+Andre Vrignaud <developer@syrinxventures.com> <andrevrignaud@andres-mac-mini.skink-velociraptor.ts.net>
+Andre Vrignaud <developer@syrinxventures.com> <andrevrignaud@Andres-Mac-mini.local>

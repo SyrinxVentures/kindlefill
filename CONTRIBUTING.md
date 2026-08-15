@@ -63,6 +63,26 @@ look for the one that already exists and extend it.
 Anything that deletes gets held to a higher standard than anything that writes. Filler is
 cheap and replaceable; a book someone sideloaded in 2014 is not.
 
+## Code written with an AI assistant
+
+Much of this repository was, and the history says so: those commits carry a
+`Co-Authored-By:` trailer naming the model. Contributions written the same way are
+welcome on the same terms.
+
+**You are the author; the assistant is a co-author.** `Author` is a person who read the
+change and vouches for it — put the model in a `Co-Authored-By:` trailer, never in
+`user.name`. A commit authored by a tool is one nobody is answerable for, which is the
+thing review exists to prevent.
+
+**Only send what you can license.** The line at the end of this file asks you to
+dual-license your contribution, and that promise is only yours to make about work you hold
+rights in. Read what you send closely enough to stand behind it.
+
+Beyond that there is no separate bar. A generated patch is held to exactly what everything
+else is: it explains *why* at the decision site, it doesn't add a second owner for a
+decision that already has one, and anything that deletes is held higher than anything that
+writes. The three commands above are the gate, whoever or whatever typed the diff.
+
 ## Scope
 
 This fills and unfills storage. It does not jailbreak anything, does not modify firmware,

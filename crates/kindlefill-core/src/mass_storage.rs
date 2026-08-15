@@ -545,6 +545,7 @@ mod windows_impl {
     use windows::core::PCWSTR;
     use windows::Win32::Storage::FileSystem::{
         GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
+        GetVolumePathNameW,
     };
 
     /// `GetDriveTypeW` return value for removable media. Plain `u32` in the Win32
@@ -640,8 +641,34 @@ mod windows_impl {
         })
     }
 
+    /// The mount point `path` sits on, NUL-terminated, as `GetVolumeInformationW`
+    /// demands.
+    ///
+    /// That call takes a *root* and nothing else: `E:\` answers, `E:\somewhere` fails
+    /// with `ERROR_DIR_NOT_ROOT`. `find` only ever produces drive roots, so reading the
+    /// flags off the path directly worked there and nowhere else — `find_in` hands back
+    /// a subdirectory, and every volume then looked unwritable. `GetVolumePathNameW`
+    /// answers for any path, and for a volume mounted into a folder rather than a
+    /// letter it returns that folder, which is the correct root to ask about anyway.
+    fn volume_root(path: &Path) -> Option<Vec<u16>> {
+        let wide = wide_root(path);
+        let mut buf = [0u16; 261];
+        // SAFETY: `wide` is NUL-terminated; the API NUL-terminates into `buf`.
+        unsafe { GetVolumePathNameW(PCWSTR(wide.as_ptr()), &mut buf) }.ok()?;
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        Some(
+            buf[..len]
+                .iter()
+                .copied()
+                .chain(std::iter::once(0))
+                .collect(),
+        )
+    }
+
     pub(super) fn volume_is_writable(root: &Path) -> bool {
-        let wide = wide_root(root);
+        let Some(wide) = volume_root(root) else {
+            return false;
+        };
         let mut flags = 0u32;
         // SAFETY: `wide` is NUL-terminated and `flags` is a live local.
         let ok = unsafe {

@@ -633,11 +633,18 @@ mod tests {
     /// `find_filler_folders` could not see, on a device whose owner had no way to find
     /// out.
     ///
-    /// The failure is forced by taking the write bit off the folder, not by running it
-    /// out of room: the virtual device reports free space from its configured capacity
-    /// but writes through to a real directory, so an over-capacity upload reports a
-    /// nonsense delta and *succeeds*. A permission error is one the backing filesystem
-    /// actually produces.
+    /// The failure is forced by putting a directory where the first upload's file has
+    /// to go, not by running it out of room: the virtual device reports free space from
+    /// its configured capacity but writes through to a real directory, so an
+    /// over-capacity upload reports a nonsense delta and *succeeds*. A name already held
+    /// by a directory is an error the backing filesystem actually produces, and produces
+    /// the same way everywhere.
+    ///
+    /// It used to clear the folder's write bit instead. That is a Unix-only lever:
+    /// Windows has no write bit on a directory, and `set_readonly` there sets an
+    /// attribute Explorer reads but `CreateFile` ignores, so the upload succeeded and
+    /// this test failed on Windows alone. Any replacement has to fail the same way on
+    /// every platform CI runs.
     #[tokio::test]
     async fn a_failed_bench_upload_leaves_nothing_behind() {
         let tmp = tempfile::tempdir().unwrap();
@@ -671,10 +678,9 @@ mod tests {
         let committed = storage
             .upload(
                 Some(dir),
-                // A name none of BENCH_SIZES uses: overwriting an existing file is
-                // allowed in a read-only folder (the write bit governs create and
-                // delete, not modify), which would let the first upload succeed and
-                // re-key the handle underneath us.
+                // A name none of BENCH_SIZES uses, so it can neither collide with the
+                // blocker below nor be re-keyed underneath us by an upload being
+                // measured.
                 NewObjectInfo::file("bench_committed.bin", MIB),
                 kindlefill_core::ZeroStream::new(MIB),
             )
@@ -683,9 +689,14 @@ mod tests {
         let mut written = vec![committed];
 
         let bench_path = tmp.path().join(BENCH_DIR);
-        set_writable(&bench_path, false);
+        // Sits on the exact name the first measured upload will create. The device
+        // never sees it — `watch_backing_dirs` is off, so it is in no object list — and
+        // it is removed before cleanup runs, because cleanup has to be able to take the
+        // folder with it and nothing here is a handle `written` holds.
+        let blocker = bench_path.join(format!("bench_{}.bin", BENCH_SIZES[0].0));
+        std::fs::create_dir(&blocker).expect("block the first upload's name");
         let measured = bench_uploads(&mut storage, dir, &mut written).await;
-        set_writable(&bench_path, true);
+        std::fs::remove_dir(&blocker).expect("unblock before cleanup");
 
         assert!(
             measured.is_err(),
@@ -702,11 +713,5 @@ mod tests {
             !bench_path.exists(),
             "a failed bench must leave no {BENCH_DIR} behind"
         );
-    }
-
-    fn set_writable(path: &std::path::Path, writable: bool) {
-        let mut perms = std::fs::metadata(path).expect("metadata").permissions();
-        perms.set_readonly(!writable);
-        std::fs::set_permissions(path, perms).expect("set permissions");
     }
 }

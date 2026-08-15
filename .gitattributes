@@ -1,0 +1,17 @@
+# Line endings are the repository's, not the checkout machine's.
+#
+# This project is developed on macOS and built in CI on macOS and Windows, so the
+# one thing that must not vary is what lands in a blob. Everything text is stored
+# and checked out LF; a Windows editor that saves CRLF is normalized on the way in
+# rather than showing up as a whole-file diff in someone else's `git status`.
+* text=auto eol=lf
+
+# Binary assets, listed because `text=auto` guesses and a wrong guess here is
+# silent: a mangled icon or DMG layout still builds, it just looks broken.
+*.png binary
+*.ico binary
+*.icns binary
+
+# No extension to guess from, and it is a Finder layout blob — corrupting it
+# breaks the DMG's window arrangement without failing the build.
+crates/kindlefill-app/dmg/DS_Store binary

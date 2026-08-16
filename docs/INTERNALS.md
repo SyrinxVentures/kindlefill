@@ -140,6 +140,54 @@ the inverse of the WPD case.
 Three paths have *not* been exercised on hardware and rest on the test suite alone —
 see [What has and hasn't been exercised on hardware](#what-has-and-hasnt-been-exercised-on-hardware).
 
+## What putting a device on the cable cost
+
+Eight bugs a green CI had no way to catch, all in code the virtual-device tests never
+reach. Root listings addressed the storage root by a sentinel handle that PTP tolerates
+and WPD rejects, which failed every device operation on Windows. The app and CLI
+binaries shared one case-insensitive path in `target/` and silently overwrote each
+other. The pre-flight estimate quoted a throughput measured on other hardware,
+advertising four minutes for a transfer that took twenty-six. A failed detect left the
+presence poll re-announcing a reconnect every two seconds forever. The activity log
+resized itself as lines arrived, moving the panel above it under the reader's eyes. And
+a resumed fill was indistinguishable on screen from one that had thrown the previous
+run's work away.
+
+Two of them concern what the tool *claims* rather than what it does, and both are worth
+keeping on the record.
+
+**A write on the WPD path does not carry the name we ask for until it commits.** The
+object is created under a driver-assigned temporary name (`NEWF4A3.tmp` and friends) and
+renamed at the end. Kill the process before then and the leftover is a file this tool
+named nothing and could recognise by nothing, so `clean` reported "nothing to remove"
+over 94 MB of its own debris. Fixed by leaving evidence rather than guessing at names: a
+fill writes `kindlefill_inflight.txt` into the filler folder and removes it on any
+ordinary exit, Stop included. A marker still there on a later run means a previous one
+died mid-write, and only then is an unrecognised file in that folder treated as ours.
+
+**And a deletion that reports success was not evidence the object was gone.**
+`IPortableDeviceContent::Delete` returns `S_OK` while refusing individual objects,
+reporting per-object outcomes in a results collection that `mtp-rs` 0.30's WPD backend
+never reads — so every refusal counted as a success, and `clean` and `purge` added those
+bytes to "reclaimed". A Kindle refuses exactly these orphaned temp objects until the USB
+session is reset, so `purge` announced 286 MB freed while free space moved by none of
+it. Deletions are now confirmed by re-listing the folder before anything is announced,
+and a refusal says so and tells you to replug. That one is not Windows-specific in
+principle: the same silence would have applied on macOS the moment a device refused a
+delete.
+
+Neither is reachable on native MTP in the form Windows hit them, though the macOS runs
+sharpened what that means. A `kill -9` mid-fill does strand the bytes on a Paperwhite:
+free space dropped by the ~400 MB in flight and stayed down across a later, successful
+MTP session, coming back only when the device was restarted. What it does not produce is
+an *object* — the partial never appears in the folder listing, so there is no debris
+carrying a name we could fail to recognise, the inverse of the WPD case. The marker has
+nothing to grip there and nothing to get wrong: across those runs the stranded bytes
+were counted as neither foreign nor filler, `clean` under-reported rather than
+over-reported them, and every byte it did claim came back. Both mechanisms cost that
+device nothing and save the other one from losing space it can never account for, which
+is the case for keeping them rather than gating them behind a transport check.
+
 ## Re-validating against hardware
 
 `probe` and `bench` answered the two questions that gated the design, and stay useful

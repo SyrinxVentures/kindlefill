@@ -86,161 +86,48 @@ deletes nothing.
 
 ## Platforms
 
-**Windows** is where **1.0.0** was validated, against both Kindles and both transports:
+**macOS** (Apple silicon) and **Windows** each ship an app and a CLI. The macOS build is
+signed with a Developer ID and notarized. The Windows installer is not signed.
+
+Two Kindles have been on the cable, and they are the only hardware this has ever run on:
 
 | | Kindle Oasis (10th gen) | Kindle Paperwhite Signature Edition |
 |---|---|---|
-| Reached over | WPD wrapping USB mass storage | native MTP |
-| Enumerates as | `SWD\WPDBUSENUM\_??_USBSTOR#…` | `USB\VID_1949&PID_9981` |
-| Also mounts as a drive | yes, `D:` | no |
+| Reached over | USB mass storage | native MTP |
 | Throughput | 3.4 MB/s | 27–30 MB/s |
-| `bench` free-space tracking | exact, zero overhead | exact, 4 KB per-file overhead |
-| Filled to the 50–90 MB window | yes | to intermediate windows only |
+| `bench` free-space tracking | exact | exact |
 
-Between them: `probe`, `bench`, `status`, `fill`, resume, Stop, `clean`, `purge`,
-foreign-file protection, staged-update detection and deletion, the overwrite
-confirmation, and recovery from a killed run. `bench` is the one that mattered on each —
-free space tracked every write exactly and promptly, which is the assumption the whole
-convergence design rests on and the reason this was blocked on hardware rather than on
-review.
+Windows was validated against both at 1.0.0. macOS was validated against the Paperwhite
+at 1.0.1, and against the Oasis at 0.2.0. Between them: `probe`, `bench`, `status`,
+`fill`, resume, Stop, `clean`, `purge`, foreign-file protection, staged-update detection
+and deletion, the overwrite confirmation, and recovery from a killed run.
 
-Two honest gaps, both narrowed since. The Paperwhite was filled into several
-intermediate windows but never taken down to 50–90 MB on Windows, so on that platform
-the smallest rungs of the size ladder are still untried — the macOS run below has since
-exercised them on the same device. And **the mounted-volume transport was not exercised
-on Windows at all** — the Oasis offered a `D:` volume, but a portable-device entry
-outranks it and the tool took that instead, while the Paperwhite offers no volume to
-take. That path was proven on macOS at 0.2.0, and `mass_storage.rs` has changed since;
-with no Oasis on the cable for the 1.0.1 runs, the mounted-volume transport is
-unvalidated at this version on **both** platforms.
+`bench` is the one that mattered on each — free space tracked every write exactly and
+promptly, which is the assumption the whole convergence design rests on and the reason
+this was blocked on hardware rather than on review.
 
-**macOS** (Apple silicon) is the platform this is built and released on, and where both
-of these devices were originally validated — the Paperwhite over MTP, the Oasis as a
-Finder volume.
+Throughput is a property of the device rather than the platform. That Oasis runs at
+about 3.4 MB/s over its micro-USB cable, so a full fill on it takes closer to half an
+hour than to the seventeen minutes quoted above.
 
-That validation was against **0.2.0**. **1.0.1 has since been run against the
-Paperwhite Signature Edition on a Mac**, over native MTP, which is what this section
-previously said had to happen before the macOS builds could stop carrying the
-unverified-on-hardware status Windows used to.
+Some things still have no hardware behind them: the mounted-volume transport at 1.0.1 on
+either platform, `ptpcamerad` taming, and Overwrite.
+[docs/INTERNALS.md](docs/INTERNALS.md) carries the full validation record, including what
+putting a device on the cable cost the tool and what each run did and didn't prove.
 
-Every surface the Windows fixes changed was exercised there. The `None`-addressed
-storage root carried `probe`, `status`, `fill`, `clean`, `purge` and `bench` without
-complaint. The identity gate recognised the Paperwhite and left Fill unheld. The
-pre-flight estimate said nothing about rate on a fresh launch — "the time depends on
-your Kindle and cable" — and only after the device had reported one did it quote
-"roughly 8 min at ~28.6 MB/s, measured on this Kindle". A failed detect followed by a
-replug announced one reconnect, not one every two seconds. The activity log held its
-height as lines arrived. Stop answered immediately mid-object. And a resumed fill said
-"Resuming — 11.00 GB of filler is already on the device (11 files), and is being kept.
-The bar below measures only what is left to write."
-
-`bench` was again the result that mattered, and it held: free space moved by precisely
-the bytes written at 16, 128 and 512 MiB — 0, 0 and 4096 bytes of overhead — at
-26.6–30.4 MB/s. Deletion accounting was exact in both directions. `clean` reported
-24.78 GB reclaimed against 24.78 GB of free space actually returned, `purge` 512 MB
-against 512 MB, and `clean` over an empty folder said `0 B` rather than inventing a
-figure. The fill was taken to the real 50–90 MB default for the first time on this
-device on either platform, landing at **81.18 MB** on the first pass with the ladder
-stepping 1 GB → 256 MB → 16 MB, no overshoot below the window and no oscillation
-around it.
-
-Two things did not come out clean, and they are worth more than the passes.
-
-**The marker file was never directly observed.** `kindlefill_inflight.txt` behaved
-correctly in every way that can be seen from outside: after a normal fill, `status`
-reported the filler and flagged nothing foreign, and across two `kill -9` runs the
-stranded bytes were never counted as foreign or as filler by either front end. But the
-CLI has no verb that lists a folder, so the file itself was never laid eyes on. Its
-consequences are verified; its existence is inferred. **The post-Stop case is weaker
-still** — since this transport produces no listable debris, a later run staying silent
-about debris says nothing either way, so whether Stop removed the marker was not
-distinguishable from outside at all.
-
-**And the CLI and the app explain the same device state differently, with only the app
-correct.** A `kill -9` mid-fill leaves this Paperwhite answering reads while refusing
-every write. The app says so precisely — that the session can wedge after an interrupted
-transfer, that the device will look fine while nothing can be written, and to replug and
-then restart the device — and replugging did clear it. The CLI, on the same condition,
-prints the `ptpcamerad` advice and tells you to quit Android File Transfer and OpenMTP.
-On the run that produced this, `ptpcamerad` was not running, `probe` said so two lines
-above the error, neither of those apps was installed, and the process actually holding
-the device was **Calibre**, which auto-launches on connect and is named nowhere. That
-sent the validation down a blind alley for five attempts. It is a wrong explanation
-rather than a broken operation, so it did not gate this release; it is queued as a fix.
-
-Putting a device on the cable cost the tool eight bugs a green CI had no way to catch,
-all in code the virtual-device tests never reach. Root listings addressed the storage
-root by a sentinel handle that PTP tolerates and WPD rejects, which failed every device
-operation on Windows. The app and CLI binaries shared one case-insensitive path in
-`target/` and silently overwrote each other. The pre-flight estimate quoted a throughput
-measured on other hardware, advertising four minutes for a transfer that took twenty-six.
-A failed detect left the presence poll re-announcing a reconnect every two seconds
-forever. The activity log resized itself as lines arrived, moving the panel above it
-under the reader's eyes. And a resumed fill was indistinguishable on screen from one
-that had thrown the previous run's work away.
-
-The last two are worth their own paragraph, because they concern what the tool *claims*
-rather than what it does.
-
-A write on the WPD path does not carry the name we ask for until it commits — the object
-is created under a driver-assigned temporary name (`NEWF4A3.tmp` and friends) and renamed
-at the end. Kill the process before then and the leftover is a file this tool named
-nothing and could recognise by nothing, so `clean` reported "nothing to remove" over
-94 MB of its own debris. Fixed by leaving evidence rather than guessing at names: a fill
-writes `kindlefill_inflight.txt` into the filler folder and removes it on any ordinary
-exit, Stop included. A marker still there on a later run means a previous one died
-mid-write, and only then is an unrecognised file in that folder treated as ours.
-
-And a deletion that reports success was not evidence the object was gone.
-`IPortableDeviceContent::Delete` returns `S_OK` while refusing individual objects,
-reporting per-object outcomes in a results collection that `mtp-rs` 0.30's WPD backend
-never reads — so every refusal counted as a success, and `clean` and `purge` added those
-bytes to "reclaimed". A Kindle refuses exactly these orphaned temp objects until the USB
-session is reset, so `purge` announced 286 MB freed while free space moved by none of it.
-Deletions are now confirmed by re-listing the folder before anything is announced, and a
-refusal says so and tells you to replug. That one is not Windows-specific in principle:
-the same silence would have applied on macOS the moment a device refused a delete.
-
-Neither of those two is reachable on native MTP in the form Windows hit them, though
-the macOS runs sharpened what that means. A `kill -9` mid-fill does strand the bytes on
-a Paperwhite: free space dropped by the ~400 MB in flight and stayed down across a
-later, successful MTP session, coming back only when the device was restarted. What it
-does not produce is an *object* — the partial never appears in the folder listing, so
-there is no debris carrying a name we could fail to recognise, which is the inverse of
-the WPD case where it becomes a visible file under a driver-assigned one. So the marker
-has nothing to grip here and nothing to get wrong: across those runs the stranded bytes
-were counted as neither foreign nor filler, `clean` under-reported rather than
-over-reported them, and every byte it did claim came back. The marker and the delete
-confirmation cost this device nothing and save the other one from losing space it can
-never account for — which is the case for keeping both rather than gating them behind a
-transport check.
-
-Throughput is a property of the device, not of Windows: that Oasis runs at about
-3.4 MB/s over its micro-USB cable, and writing to its mounted volume directly measures
-the same, so a full fill on it takes closer to half an hour than to the seventeen
-minutes quoted above.
-
-Because `open_first` opens whichever portable device Windows enumerates first, and
-every USB drive is one, the app checks what the device says it is and holds Fill behind
-an explicit opt-in when that isn't a Kindle. Filling a non-Kindle is therefore possible
-and untested, in that order.
-
-The Windows installer is unsigned, so SmartScreen will warn on first run, and installing
-on a machine without the WebView2 runtime needs a network connection (the installer
-downloads it).
+On Windows, `open_first` opens whichever portable device the OS enumerates first, and
+every USB drive is one — so the app checks what the device says it is and holds Fill
+behind an explicit opt-in when that isn't a Kindle. Filling a non-Kindle is therefore
+possible and untested, in that order.
 
 **Linux** compiles untested: volume detection looks under `/run/media/<user>/Kindle`
 and `/media/<user>/Kindle` for mass-storage Kindles, and MTP goes through `mtp-rs`'s
 libusb path, but no Linux machine has ever run this. A report either way is a
 contribution.
 
-The two devices above are the only hardware this has ever run on: a **Kindle Paperwhite
-Signature Edition** and a **Kindle Oasis (10th generation)**, each tried on both
-platforms and on whichever transport it offers there — MTP and a Finder volume on macOS,
-native MTP and the WPD mass-storage shim on Windows. Other models should work and none
-have been tried. If you run it against different hardware,
-[an issue saying what happened](https://github.com/SyrinxVentures/kindlefill/issues) —
-good or bad — is the most useful thing you could contribute.
+Other models should work and none have been tried. If you run it against different
+hardware, [an issue saying what happened](https://github.com/SyrinxVentures/kindlefill/issues)
+— good or bad — is the most useful thing you could contribute.
 
 **Sizes are binary.** 1 GB here means 1 GiB (1024³ bytes) throughout, so a capacity
 shown here reads lower than the number on the box, which is quoted in SI GB.

@@ -102,6 +102,42 @@ on a mass-storage Kindle at all. The question it exists to answer doesn't arise 
 either — free space comes from `statvfs` on a mounted filesystem, not from a device
 answering a cacheable `GetStorageInfo`.
 
+**1.0.1 was re-validated on macOS against the same Paperwhite**, over native MTP, after
+the eight fixes that Windows hardware forced into shared engine code. That run is the
+one that put those fixes in front of a Mac for the first time:
+
+| Check | Result |
+|---|---|
+| `None`-addressed storage root | Carried `probe`, `status`, `fill`, `clean`, `purge`, `bench` |
+| Free space tracks writes (`bench`) | **Exactly** — 0, 0 and 4096 bytes of overhead at 16/128/512 MiB |
+| Throughput | 26.6–30.4 MB/s |
+| `clean` reclaim vs measured free-space delta | 24.78 GB reported, 24.78 GB returned |
+| `purge` reclaim vs measured free-space delta | 512 MB reported, 512 MB returned |
+| `clean` over an empty folder | `reclaimed 0 B` — no invented figure |
+| Fill to the real 50–90 MB default | Landed at **81.18 MB**, ladder 1 GB → 256 MB → 16 MB, no overshoot or oscillation |
+| Identity gate | Paperwhite recognised; Fill not held behind the non-Kindle opt-in |
+| Pre-flight estimate before any measured rate | Quoted none; after one, "~28.6 MB/s, measured on this Kindle" |
+| Presence poll after a failed detect | One reconnect announced, not one every two seconds |
+| Activity log as lines arrived | Fixed height; panel above did not move |
+| Stop, mid-object | Immediate; "What's written is intact — Fill again to resume" |
+| Resumed fill | Named what it continued from and scoped the bar to what was left |
+
+Three caveats attach to that run and should not be lost. **The device was jailbroken**
+(Vera, KOReader installed), so a stock Paperwhite on macOS is inferred rather than
+tested. **`kindlefill_inflight.txt` was never directly observed** — its consequences held
+across normal exit, Stop and two `kill -9` runs, but the CLI has no verb that lists a
+folder, so the file's existence is inferred from behaviour. And **the CLI's `explain()`
+misdiagnoses a wedged device on macOS**: after a `kill -9` the Paperwhite answers reads
+while refusing writes, and where the app names that condition and its remedy correctly,
+the CLI prints the `ptpcamerad` advice and names Android File Transfer and OpenMTP —
+while the actual holder was Calibre, which auto-launches on connect and appears in no
+branch.
+
+A `kill -9` also strands the in-flight bytes on this device: free space dropped by the
+~400 MB in flight and stayed down across a later successful MTP session, returning only
+after a device restart. No listable object is produced, so there is no debris to name —
+the inverse of the WPD case.
+
 Three paths have *not* been exercised on hardware and rest on the test suite alone —
 see [What has and hasn't been exercised on hardware](#what-has-and-hasnt-been-exercised-on-hardware).
 
@@ -207,11 +243,13 @@ covered only by the test suite:
 - **Deleting a staged firmware update** — no update was staged on either device.
 - **Overwrite** — neither test folder ever held foreign content.
 
-One caveat remains, and it is about *when* those runs happened. The Paperwhite runs were
-made against an earlier build, before the interface was reworked, so the capacity bar,
-the terminal progress state, the armed-overwrite button and the range guards have never
-been driven over MTP against a Kindle — only against a stubbed backend in a browser and
-by the test suites.
+That caveat used to extend to *when* those runs happened — the original Paperwhite runs
+predated the interface rework, so the reworked UI had never been driven over MTP against
+a Kindle. The 1.0.1 macOS run closes that: the capacity bar, the terminal progress
+state, the resume messaging and the failure states were all driven over MTP against the
+Paperwhite. **The armed-overwrite button and the range guards still have not been** —
+the test folder never held foreign content, and the windows used were the 50–90 MB
+default and a wide intermediate one, neither of which trips a range guard.
 
 The Oasis run closes the other half of that gap: it used the released 0.2.0 `.dmg`, so
 the shipped bundle has been double-clicked and the reworked interface has driven a real

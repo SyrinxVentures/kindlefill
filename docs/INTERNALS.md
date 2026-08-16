@@ -119,7 +119,7 @@ one that put those fixes in front of a Mac for the first time:
 | Pre-flight estimate before any measured rate | Quoted none; after one, "~28.6 MB/s, measured on this Kindle" |
 | Presence poll after a failed detect | One reconnect announced, not one every two seconds |
 | Activity log as lines arrived | Fixed height; panel above did not move |
-| Stop, mid-object | Immediate; "What's written is intact — Fill again to resume" |
+| Stop, mid-object | Reported as "basically immediate" by the operator — impression, not instrumented; "What's written is intact — Fill again to resume" |
 | Resumed fill | Named what it continued from and scoped the bar to what was left |
 
 Three caveats attach to that run and should not be lost. **The device was jailbroken**

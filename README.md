@@ -153,11 +153,14 @@ inferred from that, not tested, and the difference is exactly the kind this sect
 exists to keep visible.
 
 **The marker file was never directly observed.** `kindlefill_inflight.txt` behaved
-correctly in every way that can be seen from outside — it was gone after a normal fill
-and after Stop, and across two `kill -9` runs the stranded bytes were never counted as
-foreign or as filler by either front end. But the CLI has no verb that lists a folder,
-so the file itself was never laid eyes on. Its consequences are verified; its existence
-is inferred.
+correctly in every way that can be seen from outside: after a normal fill, `status`
+reported the filler and flagged nothing foreign, and across two `kill -9` runs the
+stranded bytes were never counted as foreign or as filler by either front end. But the
+CLI has no verb that lists a folder, so the file itself was never laid eyes on. Its
+consequences are verified; its existence is inferred. **The post-Stop case is weaker
+still** — since this transport produces no listable debris, a later run staying silent
+about debris says nothing either way, so whether Stop removed the marker was not
+distinguishable from outside at all.
 
 **And the CLI and the app explain the same device state differently, with only the app
 correct.** A `kill -9` mid-fill leaves this Paperwhite answering reads while refusing

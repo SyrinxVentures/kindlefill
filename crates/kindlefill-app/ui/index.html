@@ -61,16 +61,22 @@
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { transition-duration: 1ms !important; }
   }
-  /* The window never scrolls. Everything above the log is fixed-height, so the log
-     takes the remainder — which keeps the layout exact at the default size and
-     still correct when the window is resized or a warning appears and pushes
-     everything down. A fixed log height can only be right at one window size, and it
-     wasn't right at this one.
+  /* One scrolling region in normal use: the activity log, in its own frame. Everything
+     else is sized to fit and stays where it was put.
 
-     `overflow-y: auto` rather than `hidden`: normally the log soaks up the slack and
-     no scrollbar appears at all, but when the conflict and firmware banners are both
-     showing there is genuinely more content than fits, and scrolling to it beats
-     silently clipping it. */
+     `overflow-y: auto` on the body is the last resort, and it is deliberate rather than
+     left over. There used to be three nested scroll regions — body, device panel, log —
+     and the device panel's was the harmful one, because it put the Overwrite tick below
+     a fold that gave no sign it existed. That one is gone: the panel is `flex: none` and
+     always shows all of itself.
+
+     What that costs is a case where the content genuinely exceeds the window. With a
+     foreign-file warning and a staged-update warning both showing, the panel alone
+     wants most of an 800px window, and there is no window size that fits it on a
+     1080-tall screen at 150% scaling — so the choice is not "scroll or don't", it is
+     "scroll, or clip the Fill button and the log off the bottom where nothing can reach
+     them". `hidden` here did exactly that. A scrollbar that appears only in the crowded
+     case is the lesser fault, and every control stays reachable. */
   html, body { height: 100%; }
   /* One continuous content plane divided by hairlines, rather than three bordered
      cards on a page background. Two reasons: the window's own titlebar already frames
@@ -84,14 +90,25 @@
   }
   .block { padding: 16px 20px; border-bottom: 1px solid var(--line); flex: none; }
   .block:last-child { border-bottom: none; }
-  /* `min-height: 0` is load-bearing: without it a flex item refuses to shrink below
+  /* The log block is what gives way, because it is the only thing on screen whose
+     content is expendable — you can scroll a log; you cannot scroll a button you cannot
+     see. `min-height: 0` is load-bearing: without it a flex item refuses to shrink below
      its content, and the log's own scroll area would push the page tall again. */
-  .block.grow { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
-  /* The device panel gives way before the action row does. With every callout showing
-     there is genuinely more content than a 640px window holds, and the one thing that
-     must never be pushed off the bottom is the button you opened the app to press — so
-     this panel scrolls inside itself and Fill, Stop and the progress row stay put. */
-  .block--device { flex: 0 1 auto; min-height: 96px; overflow-y: auto; }
+  /* A deeper bottom inset than the other blocks. Every other block has a hairline and
+     the next block under it to sit against; this one ends at the window edge, and the
+     log's border was landing hard against it with the standard 16px. */
+  .block.grow {
+    flex: 1 1 0; display: flex; flex-direction: column; min-height: 0;
+    padding-bottom: 22px;
+  }
+  /* Never scrolls, and therefore never hides a control. This panel used to be given a
+     fixed share of the window with `overflow-y: auto` to cope with the rest, which put
+     the Overwrite tick — the one control standing between the user and a destructive
+     act — below the fold of an inner scroll region that gave no sign it had more in it.
+     A checkbox you cannot see is a checkbox you cannot give informed consent with.
+     `flex: none` sizes the panel to its whole content, so everything in it is on screen
+     whenever it is showing at all. */
+  .block--device { flex: none; }
   /* The titlebar already says KindleFill; repeating it costs 40px and says nothing. */
   .sr-only {
     position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
@@ -243,8 +260,16 @@
      of the three endings happened. */
   #p-left.done { color: var(--ok); }
   #p-left.failed { color: var(--bad); }
+  /* One box that activity scrolls inside, and the only scrolling region in the window.
+     `flex-basis: 0` is the part that matters: with `auto` the log's base size was its
+     own content height, so every appended line re-solved the whole column and the panel
+     above visibly expanded and shrank as activity arrived. At `0` the log's size comes
+     from the space left over and nothing else, so a hundred new lines move nothing —
+     they scroll inside a box that is still exactly where it was. Its height changes
+     only when something above it appears or disappears, which is a deliberate relayout
+     rather than something happening under the reader's eyes mid-fill. */
   #log {
-    flex: 1 1 auto; min-height: 60px; margin-top: 10px;
+    flex: 1 1 0; min-height: 140px; margin-top: 10px;
     overflow-y: auto; background: var(--well); border: 1px solid var(--line);
     border-radius: var(--r-md); padding: 9px 10px;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -261,6 +286,17 @@
   .note.warn { color: var(--warn-ink); }
   @media (prefers-color-scheme: dark) { .note.warn { color: var(--warn-ink); } }
   .disclaimer { color: var(--muted); font-size: 11px; margin: 12px 0 0; }
+  /* Monospace, because the half that matters is a commit hash and hashes are read
+     character by character. `user-select: text` so it can be copied into a bug report —
+     the whole point of showing it is that someone else can act on it. */
+  /* `display: block` because it always wrapped anyway — the disclaimer fills its line —
+     and a wrapped fragment trailing an em-dash reads as a sentence that got cut off
+     rather than as a build stamp. Its own line, admitted rather than accidental. */
+  .build {
+    display: block; margin-top: 2px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: nowrap; user-select: text;
+  }
   .hidden { display: none; }
 </style>
 </head>
@@ -296,6 +332,18 @@
         <div class="note" id="foreigntext"></div>
         <ul class="names" id="foreignlist"></ul>
         <label class="ack"><input type="checkbox" id="overwrite" /> <span id="overwritelabel"></span></label>
+      </div>
+
+      <!-- Windows publishes a portable-device entry for every USB mass-storage volume,
+           and the device this opened is whichever one it enumerated first. When that
+           isn't a Kindle, saying so and holding Fill behind a tick is the whole
+           safeguard — the alternative is writing gigabytes onto someone's flash drive
+           under a header that called it a Kindle. -->
+      <div class="callout callout--warn hidden" id="notkindlewarn">
+        <div class="note" id="notkindletext"></div>
+        <label class="ack"><input type="checkbox" id="allownonkindle" />
+          <span>Fill this device anyway. I know what it is and accept that KindleFill
+            has never been tested on anything but a Kindle.</span></label>
       </div>
 
       <div class="callout callout--warn hidden" id="readonlywarn">
@@ -334,6 +382,12 @@
     <p class="disclaimer">
       Not created or endorsed by Amazon. Kindle and Amazon are trademarks of
       Amazon.com, Inc. or its affiliates.
+      <!-- Sharing the disclaimer's line rather than taking one of its own: it is
+           reference material, wanted about once per install and never during a fill,
+           and a row of its own would cost height in the one panel that has none to
+           spare. `build` is the half that answers "is my fix in this?" — see the
+           `app_version` command. -->
+      <span id="build" class="build"></span>
     </p>
   </section>
 
@@ -372,14 +426,22 @@ let device = null, busy = false;
 // longer than the debounce — so two could overlap and the second open would fail for
 // exclusive access. A detect requested during one is folded into a single re-run after.
 let detecting = false, detectAgain = false;
-// Only shapes the pre-flight estimate. Seeded from a Paperwhite Signature Edition and
-// replaced by this device's own measured throughput once a transfer reports one — so
-// the second estimate you see is about your Kindle and cable, not someone else's.
+// Only shapes the pre-flight estimate, and null until this device has actually reported
+// a rate. It used to be seeded from a Paperwhite Signature Edition at 25.5 MB/s, which
+// made the very first estimate — the only one shown before you commit — a statement
+// about someone else's hardware wearing this device's name. A 10th-generation Oasis on
+// its micro-USB cable runs at 3.4 MB/s measured, so that seed advertised four minutes
+// for a twenty-six minute transfer. Better to say only the part that is known and let
+// the progress bar, which reports the real average, say the rest.
 //
 // Worth feeding back only because the reported rate is bytes-over-elapsed-time. An
 // average of instantaneous samples reads high on bursty MTP traffic, and learning from
 // that would have made every estimate progressively more optimistic.
-let observedRate = 25.5 * MB;
+let observedRate = null;
+
+/// When the log last gained a line, so the progress heartbeat below can tell a quiet
+/// log from a busy one. Not `Date.now()` at module load: nothing has been logged yet.
+let lastLogAt = 0;
 
 function log(line) {
   const el = $('log');
@@ -389,6 +451,29 @@ function log(line) {
   // changing — so every new line re-announced every line before it.
   el.appendChild(document.createTextNode((el.childNodes.length ? '\n' : '') + line));
   if (atBottom) el.scrollTop = el.scrollHeight;
+  lastLogAt = Date.now();
+}
+
+/// How long the log may sit unchanged during a transfer before it says something.
+///
+/// The log gains a line when an object completes, and the bulk rung is 1 GiB — which is
+/// forty seconds on a fast MTP Kindle and four minutes on a 10th-gen Oasis over
+/// micro-USB. At four minutes the log reads as broken: the bar is moving, the device is
+/// working, and the one panel headed "activity" has said nothing since before you got
+/// your coffee.
+const LOG_HEARTBEAT_MS = 60_000;
+
+/// A progress line, but only into a log that has gone quiet.
+///
+/// Deliberately suppressed by ordinary activity rather than running on its own timer:
+/// on a connection fast enough to finish an object inside the interval, the completion
+/// lines already tell the story and a heartbeat on top would be duplicate noise. Every
+/// real log line pushes `lastLogAt` forward, so this speaks only in the gaps — which is
+/// exactly where the slow connections are.
+function heartbeat(p) {
+  if (!busy || Date.now() - lastLogAt < LOG_HEARTBEAT_MS) return;
+  const rate = p.rate > 0 ? ` at ${(p.rate / MB).toFixed(1)} MB/s` : '';
+  log(`  …${p.percent.toFixed(0)}% — ${p.done_human} of ${p.total_human}${rate}`);
 }
 
 function readWindow() {
@@ -409,6 +494,13 @@ function dirName() {
 /// ordinary stop-and-continue path.
 function blockedByForeign() {
   return !!(device && device.foreign.length && !$('overwrite').checked);
+}
+
+/// The same shape as `blockedByForeign`, for the same reason: Fill is held until the
+/// user has said, about this specific device, that they meant it. The backend refuses
+/// independently — this only makes the refusal visible before the click.
+function blockedByUnknownDevice() {
+  return !!(device && !device.is_kindle && !$('allownonkindle').checked);
 }
 
 /// Mirrors Window::MIN_WIDTH in plan.rs. Checked here purely so the problem is visible
@@ -477,11 +569,25 @@ function estimate() {
     return;
   }
   const toWrite = Math.max(0, device.free - aim);
-  const secs = toWrite / observedRate;
-  const mins = Math.round(secs / 60);
   const gb = (toWrite / (1024 * 1024 * 1024)).toFixed(2);
-  $('estimate').textContent =
-    `About ${gb} GB to write — roughly ${mins < 1 ? 'under a minute' : mins + ' min'} at ~${(observedRate / MB).toFixed(0)} MB/s.`;
+  // The byte count is measured; a duration before the first transfer would not be.
+  // Until this device has reported a rate there is no honest way to turn one into the
+  // other, so the sentence stops at what is known. A seeded guess used to fill the gap
+  // and the gap is wide: the seed was seven times fast for a Kindle on a slow cable,
+  // which turned a twenty-six minute wait into an advertised four — wrong in the
+  // direction that matters, on the one sentence a person reads before committing.
+  $('estimate').textContent = observedRate
+    ? `About ${gb} GB to write — roughly ${etaWords(toWrite / observedRate)} at ` +
+      `~${(observedRate / MB).toFixed(1)} MB/s, measured on this Kindle.`
+    : `About ${gb} GB to write. The time depends on your Kindle and cable — the ` +
+      `progress bar reports the rate and time remaining once the transfer starts.`;
+}
+
+/// A duration in words, from seconds. Rounds to minutes above a minute; below one, says
+/// so rather than printing "0 min".
+function etaWords(secs) {
+  const mins = Math.round(secs / 60);
+  return mins < 1 ? 'under a minute' : `${mins} min`;
 }
 
 /// The one place that decides what is clickable.
@@ -502,7 +608,8 @@ function updateControls() {
 
   // `rangeError()` belongs here and was missing: the click handler refused an invalid
   // range while this said the button was fine, so Fill looked alive and did nothing.
-  $('fill').disabled = locked || !usable || blockedByForeign() || !!rangeError();
+  $('fill').disabled = locked || !usable || blockedByForeign()
+    || blockedByUnknownDevice() || !!rangeError();
   // `writable` was missing here too, though Fill has always had it — so a read-only
   // Kindle greyed out Fill and left the button that deletes things fully live.
   $('clean').disabled = locked || !usable || device.filler_files === 0;
@@ -523,6 +630,7 @@ function updateControls() {
   $('useelsewhere').disabled = locked;
   $('delupdates').disabled = locked || !device || device.updates.length === 0;
   $('overwrite').disabled = locked;
+  $('allownonkindle').disabled = locked;
 
   // A control names its own action. Ticking Overwrite used to change nothing about
   // Fill — same label, same blue, same size as the Fill that writes into an empty
@@ -646,18 +754,43 @@ function renderDevice(d) {
   // Three states, not two. Read-only isn't a failure — the cable is fine and the device
   // answered — so painting it the same red as "no Kindle found" said something had
   // broken when nothing had.
-  $('dot').className = 'dot ' + (d.writable ? 'ok' : 'warn');
-  $('devline').textContent = d.writable ? 'Kindle connected' : 'Kindle connected — storage is read-only';
-  $('readonlywarn').classList.toggle('hidden', d.writable);
+  // An unrecognised device is a warning state whatever its storage says, and it takes
+  // the headline: "Kindle connected" over a flash drive is the one sentence that would
+  // stop someone looking any further.
+  $('dot').className = 'dot ' + (d.is_kindle && d.writable ? 'ok' : 'warn');
+  $('devline').textContent = !d.is_kindle
+    ? `${d.model} connected — not a recognised Kindle`
+    : d.writable ? 'Kindle connected' : 'Kindle connected — storage is read-only';
+  // Read-only is worth explaining only once we believe it is a Kindle; on some other
+  // device the advice to restart the Kindle is noise on top of the real problem.
+  $('readonlywarn').classList.toggle('hidden', d.writable || !d.is_kindle);
+  $('notkindlewarn').classList.toggle('hidden', !!d.is_kindle);
+  if (!d.is_kindle) {
+    $('notkindletext').textContent =
+      `This device reports itself as “${d.model}”, which is not a Kindle. Windows lists `
+      + `every USB drive alongside portable devices, so this may be a flash drive or a `
+      + `memory card that was found first. Check it is the device you mean before `
+      + `filling it — everything below refers to whatever this actually is.`;
+  } else {
+    // Cleared on every detect, so a tick given for one device is never still standing
+    // when a different one is plugged in.
+    $('allownonkindle').checked = false;
+  }
   // The app's one statement of what it is for, shown while there is nothing of ours on
   // the device — which is exactly when someone is meeting it for the first time and
   // deciding whether two numbers in megabytes are the right two numbers. It goes away
   // once there is filler, because by then the question has been answered.
   //
-  // Shown whenever there is nothing of ours on the device, callouts or not. It costs
-  // real height in the crowded state, which is paid for by the device panel scrolling
-  // inside itself rather than pushing the buttons off the bottom of the window.
-  setHint(d.filler_files === 0
+  // Withheld when any callout is up, which is new. It used to show regardless, and the
+  // height it costs was paid for by the device panel scrolling inside itself — but a
+  // panel that scrolls can hide a checkbox, so the panel no longer does, and this is
+  // what yields instead. No loss in the trade: this paragraph explains what the app is
+  // for, and a warning about a foreign file or a staged firmware image is both more
+  // urgent and more specific than a general introduction. It returns as soon as the
+  // warnings are dealt with.
+  const anyCallout = d.foreign.length > 0 || d.updates.length > 0
+    || !d.is_kindle || !d.writable;
+  setHint(d.filler_files === 0 && !anyCallout
     ? 'KindleFill is a tool to fill empty space on a Kindle which then blocks automatic '
       + 'Amazon firmware updates. It is also recommended to turn Airplane Mode on to stop '
       + 'additional checks and download attempts. If a previously downloaded firmware '
@@ -677,7 +810,8 @@ function renderDevice(d) {
     $('elsewhere').dataset.name = stray.name;
     $('elsewheretext').textContent =
       `${d.fill_dir} is empty, but ${stray.files} filler file${stray.files === 1 ? '' : 's'} ` +
-      `(${stray.human}) are in ${stray.name}. Remove only works on the folder shown above.`;
+      `(${stray.human}) ${stray.files === 1 ? 'is' : 'are'} in ${stray.name}. ` +
+      `Remove only works on the folder shown above.`;
   }
 
   const foreign = d.foreign.length > 0;
@@ -742,6 +876,10 @@ function showNoDevice(line, hint) {
   $('updatewarn').classList.add('hidden');
   $('elsewhere').classList.add('hidden');
   $('readonlywarn').classList.add('hidden');
+  $('notkindlewarn').classList.add('hidden');
+  // Unticked with the warning it belongs to: a device that goes away takes its opt-in
+  // with it, so the next one has to be agreed to on its own terms.
+  $('allownonkindle').checked = false;
   updateControls();
   estimate();
 }
@@ -780,6 +918,8 @@ listen('kindlefill://progress', (e) => {
   // useless announcement on a transfer measured in gigabytes.
   $('bar').setAttribute('aria-valuetext', $('p-left').textContent);
   $('p-right').textContent = `${p.rate_human} · ${p.eta_human} left`;
+  // Last, so a heartbeat line carries the same figures the row above it just showed.
+  heartbeat(p);
 });
 
 $('refresh').onclick = refresh;
@@ -853,6 +993,7 @@ $('dirname').oninput = () => {
 };
 
 $('overwrite').onchange = updateControls;
+$('allownonkindle').onchange = updateControls;
 
 // Two clicks rather than a native confirm(). A webview's dialog support is the host's
 // business, not ours, and a confirm() that silently returns falsy would leave this
@@ -891,7 +1032,7 @@ $('delupdates').onclick = async () => {
 $('fill').onclick = async () => {
   // updateControls owns this now; kept as an assertion, because the cost of the two
   // disagreeing was a button that looked alive and did nothing.
-  if (rangeError() || blockedByForeign()) return;
+  if (rangeError() || blockedByForeign() || blockedByUnknownDevice()) return;
   const { low, high } = readWindow();
   setBusy(true);
   $('barfill').style.width = '0%';
@@ -907,6 +1048,9 @@ $('fill').onclick = async () => {
       // bare true. The backend re-derives it from the device and refuses if the folder
       // has changed, so a confirmation can't be spent on contents nobody was shown.
       overwrite: $('overwrite').checked ? device.overwrite_token : null,
+      // Re-checked in the backend against the device open at that moment; sending it
+      // is how the tick travels, not how the decision gets made.
+      allowNonKindle: $('allownonkindle').checked,
     });
     log(outcome);
     // The engine's own sentence — "Done — 68.4 MB free, inside the target window." or
@@ -952,7 +1096,18 @@ $('clean').onclick = async () => {
 ///
 /// Skipped while busy: an operation in flight surfaces a disconnect as its own error
 /// within a second or two, and that path has the better message.
+///
+/// The comparison is against the last presence *this poll acted on*, not against
+/// `!!device`. Those look interchangeable and are not: a detect that fails leaves
+/// `device` null while the cable is still very much present, so the two can never
+/// agree again and the poll re-announced "Kindle reconnected." and re-opened the
+/// device every two seconds for as long as it stayed plugged in. A device that
+/// answers presence but fails detect is exactly the case worth not spamming — it is
+/// a locked screen, or a wedged MTP session, and hammering it neither fixes it nor
+/// lets the user read the one error that explains it. One attempt per cable change;
+/// Refresh is there for a second opinion.
 const PRESENCE_POLL_MS = 2000;
+let actedOnPresence = null;
 setInterval(async () => {
   if (busy || detecting) return;
   let present;
@@ -961,7 +1116,8 @@ setInterval(async () => {
   } catch {
     return; // transient IPC failure is not evidence the cable came out
   }
-  if (present === !!device) return;
+  if (present === actedOnPresence) return;
+  actedOnPresence = present;
   if (present) {
     log('Kindle reconnected.');
     await refresh();
@@ -972,7 +1128,16 @@ setInterval(async () => {
   }
 }, PRESENCE_POLL_MS);
 
-refresh();
+// Independent of the device: which build this is stays true whether a Kindle is on the
+// cable or not, and it is most wanted when something is wrong.
+invoke('app_version')
+  .then((v) => { $('build').textContent = v; })
+  .catch(() => {});
+
+// Seed the poll from the startup detect, so a Kindle already plugged in when the window
+// opens is not announced two seconds later as having just reconnected. If that detect
+// failed, this stays false and the poll is left with exactly one attempt at it.
+refresh().then(() => { actedOnPresence = !!device; });
 </script>
 </body>
 </html>

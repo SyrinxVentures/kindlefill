@@ -104,6 +104,16 @@ pub enum Event {
         bytes: u64,
         kind: DeletedKind,
     },
+    /// An object we asked the device to delete, and which is still there afterwards.
+    ///
+    /// Not an error, because nothing failed at the call site — that is the entire
+    /// problem. Windows answers `S_OK` to a `Delete` while refusing individual objects,
+    /// reporting the per-object outcome in a results collection that `mtp-rs` 0.30's WPD
+    /// backend never reads. The only way to find out is to look afterwards, which is
+    /// what [`delete_and_confirm`] does, and this is how it says so. Seen on a Kindle
+    /// holding orphaned temp objects from a killed transfer: the device refuses them
+    /// until the session is reset by a replug.
+    DeleteRefused { name: String, bytes: u64 },
     /// Terminal reading.
     Finished { free: u64 },
 }
@@ -124,6 +134,44 @@ pub enum DeletedKind {
     Foreign,
     /// A staged over-the-air firmware image.
     Update,
+    /// Debris from a fill that was killed mid-write, reclaimed on a later run. Told
+    /// apart from [`Self::Filler`] because it is worth saying out loud: the name is
+    /// not one of ours, and the reason we are willing to delete it anyway is the
+    /// marker described at [`INFLIGHT_MARKER`], not the name.
+    Interrupted,
+}
+
+/// A file whose presence means "a fill was running in this folder and did not finish".
+///
+/// Exists because the name we ask for is not the name on the device until the write
+/// commits. [`run_fill`] passes `fill_NNNN.bin` to the transport, and on the Windows
+/// WPD path the object is created under a driver-assigned temporary name — observed as
+/// `NEWF4A3.tmp`, `NEWF820.tmp`, `NEW1A32.tmp` across three separate runs — and renamed
+/// only when the data phase completes. Kill the process before that and what is left is
+/// a file this tool named nothing and can recognise by nothing. It consumes space that
+/// `clean` reports as "nothing to remove", because by name it genuinely isn't ours.
+///
+/// The marker replaces a guess about the name with evidence of our own making. Written
+/// once when a fill starts and removed on every ordinary exit — including a Stop, which
+/// deletes its own partial — so finding one on a later run means exactly one thing: a
+/// previous run died between those two points. Anything in that folder which is neither
+/// filler nor this marker is then debris we left, and can be reclaimed on the strength
+/// of our own record rather than by pattern-matching a driver's private conventions.
+///
+/// Deliberately not a dotfile: it has to survive round trips through MTP object
+/// listings and FAT, and it is meant to be legible to someone looking at the folder
+/// wondering what this tool put there.
+pub const INFLIGHT_MARKER: &str = "kindlefill_inflight.txt";
+
+/// Whether `name` is [`INFLIGHT_MARKER`].
+///
+/// A function rather than a bare `==` at each site because every place that classifies
+/// folder contents has to agree about it. Miss one and the marker reads as a foreign
+/// file, which would hold Fill behind an overwrite confirmation for a file this tool
+/// wrote itself — the exact opposite of what it is for.
+#[must_use]
+pub fn is_inflight_marker(name: &str) -> bool {
+    name == INFLIGHT_MARKER
 }
 
 /// How a fill ended.
@@ -249,8 +297,18 @@ async fn measure(storage: &mut Storage) -> Result<u64, Error> {
 ///
 /// Root only, and an exact name match. Nothing in this module ever recurses looking
 /// for a folder to operate on — the one folder it will touch is the one named here.
+///
+/// The root is addressed as `None`, not `Some(ObjectHandle::ROOT)`. Both work on the
+/// PTP backend — `ROOT` narrows to PTP wire handle 0, which the protocol reads as
+/// "root" — so the difference is invisible in the virtual-device tests and on macOS.
+/// It is not invisible on Windows: WPD has no root *object*, so the backend resolves
+/// a `Some(h)` parent by looking `h` up in its handle→object-id map, and `ROOT` is a
+/// sentinel that was never interned there. The lookup misses and every root listing
+/// fails with `StaleHandle`. `None` is the spelling that means "this storage's root"
+/// on both backends, and on PTP it is the more tolerant one: it also matches devices
+/// that report root children with the storage id as their parent.
 pub async fn find_fill_dir(storage: &Storage, dir_name: &str) -> Result<Option<ObjectInfo>, Error> {
-    let objects = storage.list_objects(Some(ObjectHandle::ROOT)).await?;
+    let objects = storage.list_objects(None).await?;
     Ok(objects
         .into_iter()
         .find(|o| o.is_folder() && o.filename == dir_name))
@@ -259,11 +317,9 @@ pub async fn find_fill_dir(storage: &Storage, dir_name: &str) -> Result<Option<O
 async fn ensure_fill_dir(storage: &Storage, dir_name: &str) -> Result<ObjectHandle, Error> {
     match find_fill_dir(storage, dir_name).await? {
         Some(existing) => Ok(existing.handle),
-        None => {
-            storage
-                .create_folder(Some(ObjectHandle::ROOT), dir_name)
-                .await
-        }
+        // `None` for the same reason as `find_fill_dir`: WPD resolves a create's
+        // parent through the same handle→id map, so `Some(ROOT)` fails there too.
+        None => storage.create_folder(None, dir_name).await,
     }
 }
 
@@ -275,7 +331,7 @@ async fn ensure_fill_dir(storage: &Storage, dir_name: &str) -> Result<ObjectHand
 /// didn't write.
 pub async fn list_staged_updates(storage: &Storage) -> Result<Vec<ObjectInfo>, Error> {
     let mut found: Vec<ObjectInfo> = storage
-        .list_objects(Some(ObjectHandle::ROOT))
+        .list_objects(None)
         .await?
         .into_iter()
         .filter(|o| o.is_file() && is_staged_update(&o.filename))
@@ -405,7 +461,7 @@ pub struct FillerFolder {
 /// recognises, so this can't mistake a books folder for ours.
 pub async fn find_filler_folders(storage: &Storage) -> Result<Vec<FillerFolder>, Error> {
     let mut found = Vec::new();
-    for object in storage.list_objects(Some(ObjectHandle::ROOT)).await? {
+    for object in storage.list_objects(None).await? {
         if !object.is_folder() {
             continue;
         }
@@ -445,7 +501,13 @@ pub async fn list_foreign(storage: &Storage, dir: ObjectHandle) -> Result<Vec<Ob
         .list_objects(Some(dir))
         .await?
         .into_iter()
-        .filter(|o| !(o.is_file() && filler_sequence(&o.filename).is_some()))
+        // The in-flight marker is ours, so it is not foreign — see [`INFLIGHT_MARKER`].
+        // Without this it would be listed as content the tool didn't write and hold Fill
+        // behind an Overwrite confirmation for a file the tool wrote itself.
+        .filter(|o| {
+            !(o.is_file()
+                && (filler_sequence(&o.filename).is_some() || is_inflight_marker(&o.filename)))
+        })
         .collect())
 }
 
@@ -609,12 +671,34 @@ where
     F: FnMut(Event) + Send,
 {
     Box::pin(async move {
-        let mut removed = 0;
-        for child in storage.list_objects(Some(parent)).await? {
+        let children = storage.list_objects(Some(parent)).await?;
+        for child in &children {
             if child.is_folder() {
-                removed += purge_children(storage, child.handle, on_event).await?;
+                purge_children(storage, child.handle, on_event).await?;
             }
             storage.delete(child.handle).await?;
+        }
+        // Asked of the device rather than assumed, for the reason spelled out on
+        // `delete_and_confirm`: a WPD delete answers `S_OK` while refusing individual
+        // objects, so the only way to know what went is to look. `purge` is the verb
+        // people reach for precisely when something is stuck, which makes it the worst
+        // possible place to report a deletion that did not happen.
+        let survivors: std::collections::HashSet<String> = storage
+            .list_objects(Some(parent))
+            .await?
+            .into_iter()
+            .map(|o| o.filename)
+            .collect();
+
+        let mut removed = 0;
+        for child in children {
+            if survivors.contains(&child.filename) {
+                on_event(Event::DeleteRefused {
+                    name: child.filename,
+                    bytes: child.size,
+                });
+                continue;
+            }
             // Asked of `filler_sequence` rather than assumed: a purge removes both
             // our filler and the folder's other contents, and a consumer keeping a
             // filler tally has to be able to tell which was which.
@@ -726,6 +810,35 @@ pub(crate) trait FillStorage {
         bytes: u64,
         progress: &mut (dyn FnMut(u64) -> ControlFlow<()> + Send),
     ) -> impl Future<Output = Result<bool, FillError>> + Send;
+
+    /// Write [`INFLIGHT_MARKER`] into the fill folder. Idempotent — a marker already
+    /// there is left alone rather than rewritten.
+    fn mark_inflight(&mut self) -> impl Future<Output = Result<(), FillError>> + Send;
+
+    /// Remove [`INFLIGHT_MARKER`]. Not an error when it isn't there.
+    fn clear_inflight(&mut self) -> impl Future<Output = Result<(), FillError>> + Send;
+
+    /// Debris from a previous run that died mid-write, on the marker's evidence.
+    ///
+    /// Empty when no marker is present, which is the ordinary case and must stay cheap.
+    /// When one *is* present, this returns everything in the fill folder that is neither
+    /// filler nor the marker.
+    ///
+    /// Deliberately leaves the marker in place. [`run_fill`] removes it only once the
+    /// debris is confirmed gone, because a device can refuse a deletion — and a marker
+    /// taken while the file it accounts for stays behind would strand those bytes for
+    /// good, which is the failure this whole mechanism exists to prevent.
+    fn take_interrupted(
+        &mut self,
+    ) -> impl Future<Output = Result<Vec<FillerFile<Self::FillerId>>, FillError>> + Send;
+
+    /// Every name currently in the fill folder.
+    ///
+    /// How a deletion is confirmed rather than assumed. `mtp-rs` 0.30's WPD backend
+    /// reports a refused delete as a successful one — see [`delete_and_confirm`], which
+    /// does the same job for `clean` and `purge` — so the only honest way to know an
+    /// object went is to look for it afterwards.
+    fn names_in_dir(&mut self) -> impl Future<Output = Result<Vec<String>, FillError>> + Send;
 }
 
 /// The convergence loop, written once for every transport.
@@ -776,6 +889,53 @@ where
     });
 
     target.ensure_dir().await?;
+
+    // Before anything is written: reclaim what a previous run left when it was killed
+    // mid-write. Done here rather than in `clean` because this is where the evidence is
+    // acted on — `clean` deletes by name, and the whole point of the marker is that the
+    // name is not available. Announced object by object, the same as every other
+    // deletion, so a fill that silently absorbed 94 MB of debris is not a thing that can
+    // happen without appearing in the log.
+    //
+    // Confirmed rather than assumed, and the confirmation is not decoration: a device
+    // that has not released the file handles from the killed transfer refuses these
+    // deletions, and the WPD backend reports the refusal as success. Observed exactly
+    // that way on a Kindle Oasis — a fill announced 86 MB reclaimed while the file sat
+    // where it was.
+    let debris = target.take_interrupted().await?;
+    // Whether any debris outlived the attempt. Carried to every exit below, because it
+    // decides the marker's fate: taking the marker off while the file it accounts for
+    // is still there would leave those bytes attributable to nobody, and no later run
+    // could ever claim them.
+    let mut debris_pending = false;
+    if !debris.is_empty() {
+        for item in &debris {
+            target.delete_filler(item).await?;
+        }
+        let survivors: std::collections::HashSet<String> =
+            target.names_in_dir().await?.into_iter().collect();
+        for item in debris {
+            if survivors.contains(&item.name) {
+                debris_pending = true;
+                on_event(Event::DeleteRefused {
+                    name: item.name,
+                    bytes: item.bytes,
+                });
+            } else {
+                on_event(Event::Deleted {
+                    name: item.name,
+                    bytes: item.bytes,
+                    kind: DeletedKind::Interrupted,
+                });
+            }
+        }
+    }
+    // Set once for the whole fill, not once per object. What it has to record is "a run
+    // was underway here and did not reach an ordinary exit", and that is true for the
+    // duration — so one write and one delete per fill, rather than a pair per gigabyte.
+    // Idempotent, so an unreclaimed marker from the block above simply stays.
+    target.mark_inflight().await?;
+
     let existing = target.fillers().await?;
     let mut seq = next_sequence(existing.iter().map(|f| f.name.as_str()));
     let mut rate = RateEstimator::new();
@@ -786,11 +946,17 @@ where
     loop {
         let free = target.free().await?;
         if cancel() {
+            if !debris_pending {
+                target.clear_inflight().await?;
+            }
             on_event(Event::Finished { free });
             return Ok(Outcome::Cancelled { free });
         }
         match next_step(free, window) {
             Step::Done => {
+                if !debris_pending {
+                    target.clear_inflight().await?;
+                }
                 on_event(Event::Finished { free });
                 return Ok(Outcome::InWindow { free });
             }
@@ -813,6 +979,9 @@ where
                     }
                     // Nothing of ours left to give back; the shortfall isn't ours.
                     Removal::Exhausted => {
+                        if !debris_pending {
+                            target.clear_inflight().await?;
+                        }
                         on_event(Event::Finished { free });
                         return Ok(Outcome::Overfilled { free, excess });
                     }
@@ -871,7 +1040,15 @@ where
                 if !written {
                     // Breaking out of the progress callback surfaces here as a
                     // deliberate stop, not a failure: the partial object is already
-                    // gone and everything committed before it is still good.
+                    // gone and everything committed before it is still good. Which is
+                    // exactly why the marker comes off here too — a Stop cleans up
+                    // after itself, so leaving evidence of an interrupted write would
+                    // make the next run hunt for debris that was never left. Unless
+                    // there is debris this run could not reclaim, in which case the
+                    // marker is the only thing keeping it claimable.
+                    if !debris_pending {
+                        target.clear_inflight().await?;
+                    }
                     let free = target.free().await?;
                     on_event(Event::Finished { free });
                     return Ok(Outcome::Cancelled { free });
@@ -894,6 +1071,17 @@ struct MtpFill<'a> {
 }
 
 impl MtpFill<'_> {
+    /// The marker object in `dir`, if it is there.
+    async fn inflight_handle(&mut self, dir: ObjectHandle) -> Result<Option<ObjectHandle>, Error> {
+        Ok(self
+            .storage
+            .list_objects(Some(dir))
+            .await?
+            .into_iter()
+            .find(|o| o.is_file() && is_inflight_marker(&o.filename))
+            .map(|o| o.handle))
+    }
+
     async fn find_dir(&mut self) -> Result<Option<ObjectHandle>, FillError> {
         if self.dir.is_none() {
             self.dir = find_fill_dir(self.storage, self.dir_name)
@@ -1004,6 +1192,86 @@ impl FillStorage for MtpFill<'_> {
             }
         }
     }
+
+    async fn mark_inflight(&mut self) -> Result<(), FillError> {
+        let Some(dir) = self.find_dir().await? else {
+            return Ok(());
+        };
+        // Idempotent: a resumed fill into a folder that already carries a marker would
+        // otherwise stack a second object under the same name, and MTP is happy to let
+        // two objects share one.
+        if self.inflight_handle(dir).await?.is_some() {
+            return Ok(());
+        }
+        // One byte, not zero. A zero-length object is the case most likely to be
+        // rejected or silently dropped by a device, and the whole value of this file is
+        // that it is reliably there or reliably not.
+        self.storage
+            .upload(
+                Some(dir),
+                NewObjectInfo::file(INFLIGHT_MARKER, 1),
+                ZeroStream::new(1),
+            )
+            .await
+            .map_err(|e| FillError::Mtp(e.source))?;
+        Ok(())
+    }
+
+    async fn clear_inflight(&mut self) -> Result<(), FillError> {
+        let Some(dir) = self.find_dir().await? else {
+            return Ok(());
+        };
+        if let Some(handle) = self.inflight_handle(dir).await? {
+            self.storage.delete(handle).await?;
+        }
+        Ok(())
+    }
+
+    async fn take_interrupted(&mut self) -> Result<Vec<FillerFile<ObjectHandle>>, FillError> {
+        let Some(dir) = self.find_dir().await? else {
+            return Ok(Vec::new());
+        };
+        let objects = self.storage.list_objects(Some(dir)).await?;
+        // No marker, no claim. Everything else in here keeps the benefit of the doubt
+        // it has always had — this is the one condition under which a file we cannot
+        // name is treated as ours.
+        //
+        // Presence is the whole question — the marker's handle is not wanted here,
+        // because it is `run_fill` that removes it, and only once the debris it accounts
+        // for is confirmed gone.
+        if !objects
+            .iter()
+            .any(|o| o.is_file() && is_inflight_marker(&o.filename))
+        {
+            return Ok(Vec::new());
+        }
+        Ok(objects
+            .iter()
+            .filter(|o| {
+                o.is_file()
+                    && filler_sequence(&o.filename).is_none()
+                    && !is_inflight_marker(&o.filename)
+            })
+            .map(|o| FillerFile {
+                name: o.filename.clone(),
+                bytes: o.size,
+                id: o.handle,
+            })
+            .collect())
+    }
+
+    async fn names_in_dir(&mut self) -> Result<Vec<String>, FillError> {
+        let Some(dir) = self.find_dir().await? else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .storage
+            .list_objects(Some(dir))
+            .await?
+            .into_iter()
+            .map(|o| o.filename)
+            .collect())
+    }
 }
 
 /// A full fill is a ~17-minute operation on a 32 GB device, so any UI driving it needs
@@ -1038,6 +1306,65 @@ where
     .await
 }
 
+/// Delete `victims`, then re-list the folder and announce only what actually went.
+///
+/// A deletion that reports success is not evidence the object is gone. `mtp-rs` 0.30's
+/// WPD backend hands `IPortableDeviceContent::Delete` a results collection for the
+/// per-object outcomes and never reads it, returning `Ok(())` whatever those outcomes
+/// say — and Windows returns `S_OK` overall while refusing individual objects. Observed
+/// on a Kindle Oasis: `purge` announced two orphaned temp objects deleted, 286 MB
+/// between them, and free space moved by the 64 MB of the third object alone. Both
+/// files were still on the device.
+///
+/// So the device is asked afterwards instead of taken at its word. The list is what
+/// decides: an object still present was not deleted, is not counted, and is not
+/// announced. A tool whose whole job is reclaiming space cannot be the last to know it
+/// reclaimed none, and "reclaimed 286 MB" while nothing moved is worse than an error —
+/// an error would at least have been true.
+///
+/// One listing for the whole batch rather than a confirmation per object: the round
+/// trips are what make MTP slow, and the answer is the same either way.
+async fn delete_and_confirm<F>(
+    storage: &mut Storage,
+    dir: ObjectHandle,
+    victims: Vec<(ObjectHandle, String, u64, DeletedKind)>,
+    on_event: &mut F,
+) -> Result<(usize, u64), FillError>
+where
+    F: FnMut(Event),
+{
+    if victims.is_empty() {
+        return Ok((0, 0));
+    }
+    for (handle, ..) in &victims {
+        storage.delete(*handle).await?;
+    }
+    // By name, not by handle: a device is free to re-key handles after a deletion, and
+    // a survivor wearing a new handle would read as "gone" to a comparison of handles.
+    let survivors: std::collections::HashSet<String> = storage
+        .list_objects(Some(dir))
+        .await?
+        .into_iter()
+        .map(|o| o.filename)
+        .collect();
+
+    let (mut removed, mut bytes) = (0usize, 0u64);
+    for (_, name, size, kind) in victims {
+        if survivors.contains(&name) {
+            on_event(Event::DeleteRefused { name, bytes: size });
+            continue;
+        }
+        removed += 1;
+        bytes += size;
+        on_event(Event::Deleted {
+            name,
+            bytes: size,
+            kind,
+        });
+    }
+    Ok((removed, bytes))
+}
+
 /// Remove every filler object, then the `fill_disk` folder itself.
 ///
 /// The folder is only removed if nothing but filler was in it, so a book someone
@@ -1064,16 +1391,63 @@ where
         });
     };
 
-    let (mut removed, mut bytes) = (0usize, 0u64);
-    for filler in list_fillers(storage, dir.handle).await? {
-        storage.delete(filler.handle).await?;
-        removed += 1;
-        bytes += filler.size;
-        on_event(Event::Deleted {
-            name: filler.filename,
-            bytes: filler.size,
-            kind: DeletedKind::Filler,
-        });
+    let mut victims: Vec<(ObjectHandle, String, u64, DeletedKind)> =
+        list_fillers(storage, dir.handle)
+            .await?
+            .into_iter()
+            .map(|f| (f.handle, f.filename, f.size, DeletedKind::Filler))
+            .collect();
+
+    // A marker here is the same evidence `fill` acts on, so `clean` acts on it the same
+    // way — reclaiming the debris *and* then the marker, in that order.
+    //
+    // Removing the marker alone would be worse than leaving both. The marker is the only
+    // thing that makes an unnameable file attributable to us; take it away while the file
+    // stays and the space becomes permanently unreclaimable by anything short of
+    // `purge`. So the two are removed together or not at all.
+    let before = storage.list_objects(Some(dir.handle)).await?;
+    let marker = before
+        .iter()
+        .find(|o| o.is_file() && is_inflight_marker(&o.filename))
+        .map(|o| o.handle);
+    if marker.is_some() {
+        victims.extend(
+            before
+                .iter()
+                .filter(|o| {
+                    o.is_file()
+                        && filler_sequence(&o.filename).is_none()
+                        && !is_inflight_marker(&o.filename)
+                })
+                .map(|o| {
+                    (
+                        o.handle,
+                        o.filename.clone(),
+                        o.size,
+                        DeletedKind::Interrupted,
+                    )
+                }),
+        );
+    }
+
+    let (removed, bytes) = delete_and_confirm(storage, dir.handle, victims, &mut on_event).await?;
+
+    // Last, and only after the confirmed sweep above: if the debris it points at
+    // survived, the marker has to survive with it, or the space it makes attributable
+    // becomes unreclaimable. Re-read rather than reusing `marker` — the handle may have
+    // been re-keyed by the deletions.
+    let after = storage.list_objects(Some(dir.handle)).await?;
+    let debris_left = after.iter().any(|o| {
+        o.is_file() && filler_sequence(&o.filename).is_none() && !is_inflight_marker(&o.filename)
+    });
+    if !debris_left {
+        if let Some(handle) = after
+            .iter()
+            .find(|o| o.is_file() && is_inflight_marker(&o.filename))
+            .map(|o| o.handle)
+        {
+            storage.delete(handle).await?;
+        }
     }
 
     if storage.list_objects(Some(dir.handle)).await?.is_empty() {

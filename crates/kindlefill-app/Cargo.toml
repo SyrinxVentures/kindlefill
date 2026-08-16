@@ -6,14 +6,29 @@ license.workspace = true
 repository.workspace = true
 description = "Desktop UI for kindlefill."
 
-# The crate keeps the workspace's `-app` suffix so `cargo run -p kindlefill-app`
-# still reads clearly next to `kindlefill-cli`, but the binary carries the product
-# name. Unbundled — which is how `cargo run` launches it — macOS takes the app menu
-# and Dock label straight from the executable, so without this the app introduces
-# itself as "kindlefill-app". The bundled .app was always KindleFill; only the dev
-# run disagreed.
+# Not `KindleFill`, and deliberately not restored to it by `mainBinaryName` either.
+# This name has to differ from the CLI's `kindlefill` by more than case: both crates
+# write into the same `target/<profile>/` directory, and that path is case-insensitive
+# on both platforms that matter (Windows always, macOS APFS by default). `KindleFill`
+# and `kindlefill` are one file there, so whichever crate built last silently replaced
+# the other's binary — and when cargo judged a target fresh it skipped the copy
+# entirely, leaving the *other* program sitting under this name while reporting
+# success. The sharp end was a release one: a `cargo tauri build` that considered the
+# app fresh would have bundled the CLI into the shipped app.
+#
+# `mainBinaryName: "KindleFill"` looks like it buys the old executable name back for
+# free. It does not — it renames this target to `KindleFill` at bundle time, which is
+# the colliding name again, and a bundle build then eats the CLI binary. Tried, and
+# reverted: the whole point of this rename is that no build step can quietly overwrite
+# another's output.
+#
+# What that costs is the executable's own name, in the two places an executable name
+# is visible: the macOS Dock label on an *unbundled* `cargo run`, and Task Manager on
+# Windows. Nothing user-facing moves — `productName` still names the .app, the NSIS
+# installer, the Start Menu entry, and the window title, and a bundled macOS app takes
+# its Dock label from the bundle's Info.plist rather than from this.
 [[bin]]
-name = "KindleFill"
+name = "kindlefill-desktop"
 path = "src/main.rs"
 
 [build-dependencies]

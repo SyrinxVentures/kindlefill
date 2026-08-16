@@ -13,8 +13,14 @@ use std::io::{self, IsTerminal};
 use std::time::Instant;
 
 #[derive(Parser)]
+// `version` takes it from `CARGO_PKG_VERSION`, which the workspace supplies — the same
+// single declaration the app window and the installers read, so `kindlefill --version`
+// and the number on the KindleFill window can never disagree. A tool that reports what a
+// device did needs to be able to say which build reported it; a bug report naming
+// neither is a bug report about nothing.
 #[command(
     name = "kindlefill",
+    version,
     about = "Fill a Kindle's storage to block OTA updates"
 )]
 struct Cli {
@@ -233,8 +239,10 @@ async fn bench() -> Result<()> {
     let baseline = storage.info().free_space;
     println!("baseline free: {}", human_bytes(baseline));
 
+    // `None`, not `Some(ObjectHandle::ROOT)` — see `engine::find_fill_dir`. WPD has no
+    // root object to look up, so the sentinel spelling fails on Windows hardware.
     let dir = storage
-        .create_folder(Some(ObjectHandle::ROOT), BENCH_DIR)
+        .create_folder(None, BENCH_DIR)
         .await
         .context("could not create a folder at the storage root")?;
 
@@ -516,7 +524,34 @@ async fn fill(low: u64, high: u64, dir_name: &str, overwrite: bool) -> Result<()
                 }
                 println!("finished at {} free", human_bytes(free));
             }
-            Event::Deleted { .. } => {}
+            // Reclaimed debris from a killed run is worth a line — it is space
+            // appearing from somewhere the user did not ask about, and silence here is
+            // what let 94 MB sit unaccounted for in the first place. The removal branch's
+            // own deletions stay quiet: those are the fill trimming its way into the
+            // window, which the free-space readings already narrate.
+            Event::Deleted { name, bytes, kind } => {
+                if kind == engine::DeletedKind::Interrupted {
+                    if drew_bar && tty {
+                        eprintln!();
+                        drew_bar = false;
+                    }
+                    println!(
+                        "  reclaimed {name} ({}) — left by a run that was killed mid-write",
+                        human_bytes(bytes)
+                    );
+                }
+            }
+            Event::DeleteRefused { name, bytes } => {
+                if drew_bar && tty {
+                    eprintln!();
+                    drew_bar = false;
+                }
+                eprintln!(
+                    "  !! {name} ({}) could not be deleted — the device refused it. \
+                     Unplug and replug the Kindle, then try again.",
+                    human_bytes(bytes)
+                );
+            }
         },
     )
     .await?;
@@ -552,6 +587,13 @@ async fn clean(dir_name: &str) -> Result<()> {
             removed += bytes;
             println!("  deleted {name} ({})", human_bytes(bytes));
         }
+        // The one case where saying nothing would be a lie by omission: the object is
+        // still on the device and its bytes are still spent.
+        Event::DeleteRefused { name, bytes } => eprintln!(
+            "  !! {name} ({}) was NOT deleted — the device refused it. Unplug and \
+             replug the Kindle, then run this again.",
+            human_bytes(bytes)
+        ),
         Event::Finished { free } => println!("free now {}", human_bytes(free)),
         _ => {}
     })
@@ -586,14 +628,31 @@ async fn clean(dir_name: &str) -> Result<()> {
 async fn purge(dir_name: &str) -> Result<()> {
     let device = open().await?;
     let mut storage = writable_storage(&device).await?;
-    let removed = engine::purge_fill_dir(&mut storage, dir_name, |event| {
-        if let Event::Deleted { name, bytes, .. } = event {
+    let mut refused = 0usize;
+    let removed = engine::purge_fill_dir(&mut storage, dir_name, |event| match event {
+        Event::Deleted { name, bytes, .. } => {
             println!("  deleted {name} ({})", human_bytes(bytes));
         }
+        Event::DeleteRefused { name, bytes } => {
+            refused += 1;
+            eprintln!(
+                "  !! {name} ({}) was NOT deleted — the device refused it.",
+                human_bytes(bytes)
+            );
+        }
+        _ => {}
     })
     .await?;
 
-    if removed == 0 {
+    // Told apart from an empty folder, because the two need opposite reactions: one is
+    // "there was nothing to do", the other is "there was, and it did not happen".
+    if refused > 0 {
+        println!(
+            "{refused} item(s) could not be deleted and are still on the device. This is \
+             usually an interrupted transfer the device has not released — unplug and \
+             replug the Kindle, then run this again."
+        );
+    } else if removed == 0 {
         println!("nothing to remove — no {dir_name} folder at the storage root, or it was empty");
     } else {
         println!("emptied {dir_name}: {removed} item(s) deleted (the folder itself is left)");

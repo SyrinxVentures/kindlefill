@@ -24,6 +24,9 @@ drag KindleFill to Applications. Apple silicon only — see [Platforms](#platfor
 Released builds are signed with a Developer ID and notarized by Apple, so they open on a
 double-click with no warning to dismiss.
 
+Windows builds are not published yet — build from source, or see
+[Platforms](#platforms).
+
 Also turn on **Airplane Mode**. Filling the storage stops the download; Airplane Mode
 stops the check.
 
@@ -57,6 +60,16 @@ By default, only files it can prove it wrote — names matching its own `fill_NN
 pattern exactly — plus the filler folder itself when nothing else was left in it. A book
 you dropped in that folder survives, and so does the folder holding it.
 
+There is one file it deletes without being able to read its name, and it earns that by
+leaving evidence first. A fill writes `kindlefill_inflight.txt` into the filler folder
+and removes it on every ordinary exit, Stop included. Finding one on a later run means a
+previous fill was killed mid-write — and on Windows the object it was writing carries a
+name the driver chose, not ours. Only with that marker present is an unrecognised file
+in that folder treated as debris and reclaimed, and it is named in the log when it goes.
+Without the marker the same file is left alone, exactly as before. The marker is removed
+only once the debris is confirmed gone, so a device that refuses the deletion keeps the
+one piece of evidence that makes those bytes reclaimable later.
+
 Two paths go further, and both need you to ask for them by name:
 
 - **Overwrite** empties the filler folder, whatever is in it.
@@ -71,30 +84,105 @@ deletes nothing.
 
 ## Platforms
 
-**macOS** (Apple silicon) is the platform this is built, released, and validated on.
+**Windows** is the platform this release was validated on, against both Kindles and both
+transports:
 
-**Windows** compiles and its test suite runs in CI, and every known platform gap has a
-written-down answer in the code — device presence goes through the WPD device list,
-unreported storage capacity is refused rather than read as "0 bytes free", and
-`cargo tauri build` produces an NSIS installer. What CI green does **not** mean: the
-tests drive the engine through a virtual device on the PTP-over-USB backend, so they
-exercise none of the WPD code a real Kindle uses on Windows. Nobody has yet held a
-Kindle against a Windows build of this; until `kindlefill probe` and `bench` have been
-run there against hardware — in particular, until `bench` shows free space moving
-promptly after each write, which the whole convergence design rests on — treat Windows
-as compiled, not supported. The Windows installer is unsigned, so SmartScreen will warn
-on first run, and installing on a machine without the WebView2 runtime needs a network
-connection (the installer downloads it).
+| | Kindle Oasis (10th gen) | Kindle Paperwhite Signature Edition |
+|---|---|---|
+| Reached over | WPD wrapping USB mass storage | native MTP |
+| Enumerates as | `SWD\WPDBUSENUM\_??_USBSTOR#…` | `USB\VID_1949&PID_9981` |
+| Also mounts as a drive | yes, `D:` | no |
+| Throughput | 3.4 MB/s | 27–30 MB/s |
+| `bench` free-space tracking | exact, zero overhead | exact, 4 KB per-file overhead |
+| Filled to the 50–90 MB window | yes | to intermediate windows only |
+
+Between them: `probe`, `bench`, `status`, `fill`, resume, Stop, `clean`, `purge`,
+foreign-file protection, staged-update detection and deletion, the overwrite
+confirmation, and recovery from a killed run. `bench` is the one that mattered on each —
+free space tracked every write exactly and promptly, which is the assumption the whole
+convergence design rests on and the reason this was blocked on hardware rather than on
+review.
+
+Two honest gaps. The Paperwhite was filled into several intermediate windows but never
+taken down to 50–90 MB, so on that device the smallest rungs of the size ladder are
+untried. And **the mounted-volume transport was not exercised on Windows at all** — the
+Oasis offered a `D:` volume, but a portable-device entry outranks it and the tool took
+that instead, while the Paperwhite offers no volume to take. That path remains proven
+only on macOS.
+
+**macOS** (Apple silicon) is the platform this is built and released on, and where both
+of these devices were originally validated — the Paperwhite over MTP, the Oasis as a
+Finder volume.
+
+That validation was against **0.2.0**. Every fix below is in shared code, most of it in
+the engine both platforms run, and none of it has been put in front of a Mac. The tests
+pass and the changes are the more tolerant spelling on the PTP path macOS uses, but
+"should be fine" is exactly the claim this section exists to stop making. Until 1.0.0 has
+been run against a Kindle on a Mac, treat the macOS builds as carrying the same
+unverified-on-hardware status Windows used to.
+
+Putting a device on the cable cost the tool eight bugs a green CI had no way to catch,
+all in code the virtual-device tests never reach. Root listings addressed the storage
+root by a sentinel handle that PTP tolerates and WPD rejects, which failed every device
+operation on Windows. The app and CLI binaries shared one case-insensitive path in
+`target/` and silently overwrote each other. The pre-flight estimate quoted a throughput
+measured on other hardware, advertising four minutes for a transfer that took twenty-six.
+A failed detect left the presence poll re-announcing a reconnect every two seconds
+forever. And the activity log resized itself as lines arrived, moving the panel above it
+under the reader's eyes.
+
+The last two are worth their own paragraph, because they concern what the tool *claims*
+rather than what it does.
+
+A write on the WPD path does not carry the name we ask for until it commits — the object
+is created under a driver-assigned temporary name (`NEWF4A3.tmp` and friends) and renamed
+at the end. Kill the process before then and the leftover is a file this tool named
+nothing and could recognise by nothing, so `clean` reported "nothing to remove" over
+94 MB of its own debris. Fixed by leaving evidence rather than guessing at names: a fill
+writes `kindlefill_inflight.txt` into the filler folder and removes it on any ordinary
+exit, Stop included. A marker still there on a later run means a previous one died
+mid-write, and only then is an unrecognised file in that folder treated as ours.
+
+And a deletion that reports success was not evidence the object was gone.
+`IPortableDeviceContent::Delete` returns `S_OK` while refusing individual objects,
+reporting per-object outcomes in a results collection that `mtp-rs` 0.30's WPD backend
+never reads — so every refusal counted as a success, and `clean` and `purge` added those
+bytes to "reclaimed". A Kindle refuses exactly these orphaned temp objects until the USB
+session is reset, so `purge` announced 286 MB freed while free space moved by none of it.
+Deletions are now confirmed by re-listing the folder before anything is announced, and a
+refusal says so and tells you to replug. That one is not Windows-specific in principle:
+the same silence would have applied on macOS the moment a device refused a delete.
+
+Neither of those two is reachable on native MTP, as it turned out: a Paperwhite discards
+an uncommitted object outright when the session drops, leaving nothing to strand and
+nothing to misreport. The marker and the delete confirmation cost that device nothing and
+save the other one from losing space it can never account for — which is the case for
+keeping both rather than gating them behind a transport check.
+
+Throughput is a property of the device, not of Windows: that Oasis runs at about
+3.4 MB/s over its micro-USB cable, and writing to its mounted volume directly measures
+the same, so a full fill on it takes closer to half an hour than to the seventeen
+minutes quoted above.
+
+Because `open_first` opens whichever portable device Windows enumerates first, and
+every USB drive is one, the app checks what the device says it is and holds Fill behind
+an explicit opt-in when that isn't a Kindle. Filling a non-Kindle is therefore possible
+and untested, in that order.
+
+The Windows installer is unsigned, so SmartScreen will warn on first run, and installing
+on a machine without the WebView2 runtime needs a network connection (the installer
+downloads it).
 
 **Linux** compiles untested: volume detection looks under `/run/media/<user>/Kindle`
 and `/media/<user>/Kindle` for mass-storage Kindles, and MTP goes through `mtp-rs`'s
 libusb path, but no Linux machine has ever run this. A report either way is a
 contribution.
 
-Validated on macOS against two devices, one per transport: a **Kindle Paperwhite
-Signature Edition** over MTP, and a **Kindle Oasis (10th generation)** as a Finder volume
-— fill, Stop, resume, and Remove filler & folder all ran on both. Other models should
-work and none have been tried. If you run it against different hardware,
+The two devices above are the only hardware this has ever run on: a **Kindle Paperwhite
+Signature Edition** and a **Kindle Oasis (10th generation)**, each tried on both
+platforms and on whichever transport it offers there — MTP and a Finder volume on macOS,
+native MTP and the WPD mass-storage shim on Windows. Other models should work and none
+have been tried. If you run it against different hardware,
 [an issue saying what happened](https://github.com/SyrinxVentures/kindlefill/issues) —
 good or bad — is the most useful thing you could contribute.
 

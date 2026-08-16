@@ -30,10 +30,21 @@ and the release notes say so rather than claiming otherwise: the build asks `spc
 whether Gatekeeper actually accepts the bundle and picks between two sets of notes from
 the answer, so a failed notarization cannot be published as a successful one.
 
-The `-p kindlefill-app` above is the crate; the binary it produces is `KindleFill`.
-Unbundled, macOS takes the Dock and app-menu label from the executable name, so
-without that the app would introduce itself as "kindlefill-app" during development
-while the shipped bundle said KindleFill.
+The `-p kindlefill-app` above is the crate; the binary it produces is
+`kindlefill-desktop`, and that is also the executable inside the shipped bundle. It
+cannot be called `KindleFill`: the CLI's binary is `kindlefill`, both crates write
+into the same `target/<profile>/` directory, and that path is case-insensitive on
+Windows and on APFS — so the two overwrote each other silently, in whichever order
+they happened to be built, and a `cargo tauri build` that considered the app fresh
+would have bundled the CLI into the shipped app.
+
+`mainBinaryName` would rename it back to `KindleFill` at bundle time and is
+deliberately not set, because that is the colliding name again and a bundle build
+then destroys the CLI binary. The executable's name is visible in exactly two places
+— the macOS Dock label on an unbundled `cargo run`, and Windows Task Manager. The
+product is still KindleFill everywhere a user looks: `productName` names the .app,
+the DMG, the NSIS installer, the Start Menu entry, and the window title, and a
+bundled macOS app takes its Dock label from Info.plist rather than the executable.
 
 The frontend is a single static HTML file with no framework and no build step, so
 `cargo run` is enough — there's no dev server to start first.

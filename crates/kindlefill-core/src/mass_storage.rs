@@ -221,7 +221,14 @@ impl MountedKindle {
         Ok(self
             .entries(&path)?
             .into_iter()
-            .filter(|e| e.is_dir || engine::filler_sequence(&e.name).is_none())
+            // The in-flight marker is ours, so it is not foreign — the MTP `list_foreign`
+            // makes the same exclusion, and the two must agree or Fill would be held
+            // behind an overwrite confirmation on one transport and not the other.
+            .filter(|e| {
+                e.is_dir
+                    || (engine::filler_sequence(&e.name).is_none()
+                        && !engine::is_inflight_marker(&e.name))
+            })
             .collect())
     }
 
@@ -374,6 +381,25 @@ impl MountedKindle {
                 kind: DeletedKind::Filler,
             });
         }
+        // Debris and marker together, never the marker alone — see the MTP `clean` for
+        // why: the marker is what makes an unnameable file attributable to us, so
+        // removing it while the file stays would strand that space for good.
+        if dir.join(engine::INFLIGHT_MARKER).exists() {
+            for debris in self.list_foreign(name).map_err(io_error)? {
+                if debris.is_dir {
+                    continue;
+                }
+                fs::remove_file(dir.join(&debris.name)).map_err(io_error)?;
+                removed += 1;
+                bytes += debris.bytes;
+                on_event(Event::Deleted {
+                    name: debris.name,
+                    bytes: debris.bytes,
+                    kind: DeletedKind::Interrupted,
+                });
+            }
+            fs::remove_file(dir.join(engine::INFLIGHT_MARKER)).map_err(io_error)?;
+        }
         if self.entries(&dir).map_err(io_error)?.is_empty() {
             fs::remove_dir(dir).map_err(io_error)?;
         }
@@ -463,6 +489,66 @@ impl engine::FillStorage for MassFill<'_> {
         progress: &mut (dyn FnMut(u64) -> ControlFlow<()> + Send),
     ) -> Result<bool, FillError> {
         write_zeros(&self.dir().join(name), bytes, progress).map_err(io_error)
+    }
+
+    /// Implemented here too, though this transport is not the one that needed it.
+    ///
+    /// A filesystem write creates the file at its final path from the first byte, so a
+    /// process killed mid-write leaves a short `fill_NNNN.bin` — a name `list_fillers`
+    /// already recognises and `clean` already removes. There is no unnameable debris to
+    /// reclaim. The marker is still written and cleared on this path so that a device
+    /// used from both transports cannot end up with a stale marker that nothing ever
+    /// takes off, and so that the two transports behave identically where they can.
+    async fn mark_inflight(&mut self) -> Result<(), FillError> {
+        let path = self.dir().join(engine::INFLIGHT_MARKER);
+        if path.exists() {
+            return Ok(());
+        }
+        fs::write(&path, b"kindlefill: a fill was underway in this folder\n").map_err(io_error)
+    }
+
+    async fn clear_inflight(&mut self) -> Result<(), FillError> {
+        match fs::remove_file(self.dir().join(engine::INFLIGHT_MARKER)) {
+            Ok(()) => Ok(()),
+            // Already gone is the goal, not a failure.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(io_error(e)),
+        }
+    }
+
+    async fn take_interrupted(&mut self) -> Result<Vec<engine::FillerFile<()>>, FillError> {
+        let dir = self.dir();
+        if !dir.join(engine::INFLIGHT_MARKER).exists() {
+            return Ok(Vec::new());
+        }
+        // The marker stays until `run_fill` has confirmed the debris went — same
+        // contract as the MTP side, even though a filesystem delete does not lie.
+        Ok(self
+            .kindle
+            .list_foreign(self.name)
+            .map_err(io_error)?
+            .into_iter()
+            .filter(|e| !e.is_dir)
+            .map(|e| engine::FillerFile {
+                name: e.name,
+                bytes: e.bytes,
+                id: (),
+            })
+            .collect())
+    }
+
+    async fn names_in_dir(&mut self) -> Result<Vec<String>, FillError> {
+        let dir = self.dir();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .kindle
+            .entries(&dir)
+            .map_err(io_error)?
+            .into_iter()
+            .map(|e| e.name)
+            .collect())
     }
 }
 

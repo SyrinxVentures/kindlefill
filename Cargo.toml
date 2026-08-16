@@ -3,7 +3,13 @@ members = ["crates/kindlefill-core", "crates/kindlefill-cli", "crates/kindlefill
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+# The single place a version is declared. `tauri.conf.json` deliberately does not carry
+# one — Tauri falls back to this when the key is absent — so the .app, the .dmg, the NSIS
+# installer, both binaries and the version shown in the window cannot disagree about
+# what they are. Two declarations is one more than can be kept in step by hand, and the
+# failure is silent: a macOS build and a Windows build of the same commit calling
+# themselves different versions.
+version = "1.0.0"
 edition = "2021"
 # Matches mtp-rs and the Rust ecosystem default. Apache-2.0 carries the explicit
 # patent grant; MIT is the shorter, more universally recognized option. Downstream

@@ -94,7 +94,15 @@ impl From<&mtp_rs::ObjectInfo> for NamedObject {
 
 #[derive(Serialize, Clone)]
 struct DeviceSnapshot {
+    /// What the device calls itself. Was the literal string "Kindle" for every MTP
+    /// device regardless of what answered, which on Windows meant a flash drive could
+    /// be introduced as a Kindle in the one place a user would look to notice it
+    /// wasn't.
     model: String,
+    /// Whether [`Identity`] recognised the device. `false` puts a warning and an
+    /// opt-in tick in front of Fill; it does not disable anything else, because
+    /// reading a device is not what needed guarding.
+    is_kindle: bool,
     storage: String,
     total: u64,
     free: u64,
@@ -294,6 +302,50 @@ enum Session {
     Mass(MountedKindle),
 }
 
+/// What the open device says it is, and whether that reads as a Kindle.
+///
+/// One type derived in one place, because `detect` and `start_fill` open the device
+/// separately and must not be able to reach different answers: the panel says "not a
+/// recognised Kindle" and puts a checkbox in front of Fill, and the backend then
+/// re-derives the same verdict before writing. A UI-only check would be no check at
+/// all — the webview is where the tick comes from.
+struct Identity {
+    /// For the header. The device's own words when it has any, so a wrong device is
+    /// recognisable *as* wrong rather than being labelled "Kindle" regardless.
+    label: String,
+    is_kindle: bool,
+}
+
+impl Session {
+    fn identity(&self) -> Identity {
+        match self {
+            Session::Mtp { _device, .. } => {
+                let info = _device.device_info();
+                let (manufacturer, model) = (info.manufacturer.trim(), info.model.trim());
+                // Both fields, trimmed and joined, minus whichever is empty: this Oasis
+                // reports "Kindle" / "Internal Storage" and reads best as both, while a
+                // device that fills only one field should not gain a stray space.
+                let label = match (manufacturer.is_empty(), model.is_empty()) {
+                    (true, true) => "Unknown device".to_string(),
+                    (true, false) => model.to_string(),
+                    (false, true) => manufacturer.to_string(),
+                    (false, false) => format!("{manufacturer} {model}"),
+                };
+                Identity {
+                    is_kindle: kindlefill_core::looks_like_kindle(manufacturer, model),
+                    label,
+                }
+            }
+            // Already established by the transport itself, which mounts nothing that
+            // isn't a volume named `Kindle` holding a `documents` folder.
+            Session::Mass(_) => Identity {
+                label: "Kindle".to_string(),
+                is_kindle: true,
+            },
+        }
+    }
+}
+
 /// Open the Kindle and its writable storage.
 ///
 /// The daemon is tamed for the whole session rather than only at open time: launchd
@@ -400,6 +452,9 @@ fn forward(app: &AppHandle, event: Event) {
             ..
         } => device_update(app, None, -1, -(*bytes as i64)),
         Event::Deleted { .. } => {}
+        // Nothing left the device, so nothing may move the tally. The whole point of
+        // this event is that the optimistic accounting was wrong.
+        Event::DeleteRefused { .. } => {}
         Event::Finished { free } => device_update(app, Some(*free), 0, 0),
         Event::Progress(_) => {}
     }
@@ -440,14 +495,34 @@ fn forward(app: &AppHandle, event: Event) {
                 human_bytes(free)
             ),
         ),
-        Event::Deleted { name, bytes, .. } => {
-            log(app, format!("Deleted {name} ({}).", human_bytes(bytes)))
-        }
+        Event::Deleted { name, bytes, kind } => log(
+            app,
+            match kind {
+                engine::DeletedKind::Interrupted => format!(
+                    "Reclaimed {name} ({}) — left behind by a run that was killed \
+                     mid-write.",
+                    human_bytes(bytes)
+                ),
+                _ => format!("Deleted {name} ({}).", human_bytes(bytes)),
+            },
+        ),
+        Event::DeleteRefused { name, bytes } => log(
+            app,
+            format!(
+                "Could NOT delete {name} ({}) — the device refused it and the space was \
+                 not reclaimed. Unplug and replug the Kindle, then try again.",
+                human_bytes(bytes)
+            ),
+        ),
         Event::Finished { free } => log(app, format!("Finished at {} free.", human_bytes(free))),
     }
 }
 
-async fn detect_mtp(storage: &mut Storage, dir_name: String) -> Result<DeviceSnapshot, String> {
+async fn detect_mtp(
+    storage: &mut Storage,
+    identity: Identity,
+    dir_name: String,
+) -> Result<DeviceSnapshot, String> {
     storage.refresh().await.map_err(|e| explain(&e))?;
 
     let (mut filler_files, mut filler_bytes) = (0usize, 0u64);
@@ -499,7 +574,8 @@ async fn detect_mtp(storage: &mut Storage, dir_name: String) -> Result<DeviceSna
 
     let info = storage.info();
     Ok(DeviceSnapshot {
-        model: "Kindle".to_string(),
+        model: identity.label,
+        is_kindle: identity.is_kindle,
         storage: info.description.clone(),
         total: info.total_capacity,
         free: info.free_space,
@@ -549,6 +625,9 @@ fn detect_mass(kindle: &MountedKindle, dir_name: String) -> Result<DeviceSnapsho
     };
     Ok(DeviceSnapshot {
         model: "Kindle (USB storage)".to_string(),
+        // The transport is the check here: nothing mounts as this that isn't a volume
+        // named `Kindle` with a `documents` folder in it.
+        is_kindle: true,
         storage: kindle.root().display().to_string(),
         total: space.total,
         free: space.free,
@@ -586,8 +665,12 @@ fn detect_mass(kindle: &MountedKindle, dir_name: String) -> Result<DeviceSnapsho
 async fn detect(state: State<'_, AppState>, dir_name: String) -> Result<DeviceSnapshot, String> {
     let _op = claim(&state)?;
     engine::validate_dir_name(&dir_name).map_err(|e| e.to_string())?;
-    match open_device().await? {
-        Session::Mtp { mut storage, .. } => detect_mtp(&mut storage, dir_name).await,
+    let session = open_device().await?;
+    // Read before the match consumes the session, so the panel names whatever actually
+    // answered rather than what we hoped would.
+    let identity = session.identity();
+    match session {
+        Session::Mtp { mut storage, .. } => detect_mtp(&mut storage, identity, dir_name).await,
         Session::Mass(kindle) => detect_mass(&kindle, dir_name),
     }
 }
@@ -643,6 +726,12 @@ async fn delete_updates(
 /// `overwrite` is the token from the [`DeviceSnapshot`] whose foreign listing the user
 /// confirmed, or `None` to leave the folder alone. Deliberately not a `bool`: a flag
 /// says the user agreed to *something*, a token says to what.
+///
+/// `allow_non_kindle` is the tick from the panel, and it is re-checked here against the
+/// device that is open *now* rather than trusted as permission already granted. The
+/// webview cannot be the only thing standing between "the first WPD device Windows
+/// enumerated" and a multi-gigabyte write, and the device can change between the detect
+/// that raised the question and the Fill that acts on it.
 #[tauri::command]
 async fn start_fill(
     app: AppHandle,
@@ -651,12 +740,33 @@ async fn start_fill(
     high: u64,
     dir_name: String,
     overwrite: Option<String>,
+    allow_non_kindle: bool,
 ) -> Result<String, String> {
     let _op = claim(&state)?;
     let window = Window::new(low, high).map_err(|e| e.to_string())?;
     engine::validate_dir_name(&dir_name).map_err(|e| e.to_string())?;
 
     let session = open_device().await?;
+
+    let identity = session.identity();
+    if !identity.is_kindle && !allow_non_kindle {
+        return Err(format!(
+            "This device reports itself as \"{}\", which is not a Kindle. Filling it \
+             would write gigabytes to whatever it actually is. If you know what this \
+             device is and want to fill it anyway, tick the box above Fill.",
+            identity.label
+        ));
+    }
+    if !identity.is_kindle {
+        log(
+            &app,
+            format!(
+                "Filling \"{}\", which is not a recognised Kindle — you opted in. This \
+                 has not been tested on non-Kindle devices.",
+                identity.label
+            ),
+        );
+    }
 
     // Published only once the device is open, not before: a token published ahead of a
     // failed open outlives the command that made it, and Stop then pulls on a token
@@ -836,6 +946,21 @@ async fn start_clean(
 /// still no session, and WPD stays multi-client during a fill on Windows.) Opening
 /// the device properly to answer "is the cable still in?" would be both wasteful and
 /// impossible during a fill, which is exactly when the answer matters.
+/// What this build is, for the window to show.
+///
+/// Both halves earn their place: the version is what a user reports, and the commit is
+/// what makes two builds of that version distinguishable — which matters most in
+/// exactly the situation this tool keeps finding itself in, a fix in hand and a device
+/// on the cable, asking whether the binary in front of you contains it.
+#[tauri::command]
+fn app_version() -> String {
+    format!(
+        "v{} · {}",
+        env!("CARGO_PKG_VERSION"),
+        env!("KINDLEFILL_BUILD")
+    )
+}
+
 #[tauri::command]
 fn device_present() -> bool {
     MountedKindle::find().is_ok_and(|kindle| kindle.is_some()) || mtp_on_bus()
@@ -875,7 +1000,8 @@ fn main() {
             start_clean,
             delete_updates,
             device_present,
-            cancel_fill
+            cancel_fill,
+            app_version
         ])
         .run(tauri::generate_context!())
         .expect("failed to start KindleFill");

@@ -451,6 +451,222 @@ async fn refusing_below_the_window_says_where_the_filler_actually_is() {
     }
 }
 
+/// The bug these four tests exist for, in one sentence: on the Windows WPD path the
+/// object being written carries a driver-assigned temporary name until the write
+/// commits, so a process killed mid-write leaves a file this tool named nothing, cannot
+/// recognise, and therefore reported as "nothing to remove" while it consumed space.
+///
+/// Reproduced here rather than only on hardware because the mechanism is not
+/// Windows-specific even though the symptom is: what makes the debris reclaimable is
+/// the marker, and the marker's contract — set during a fill, gone after any ordinary
+/// exit — is transport-independent and belongs under test.
+mod interrupted_writes {
+    use super::*;
+
+    /// What a killed fill leaves behind: the marker, plus an object under the name the
+    /// driver chose rather than the one we asked for.
+    async fn strand_debris(storage: &Storage, temp_name: &str, size: u64) {
+        let dir = storage
+            .create_folder(None, DIR)
+            .await
+            .expect("create fill dir");
+        put(storage, dir, engine::INFLIGHT_MARKER, 1).await;
+        put(storage, dir, temp_name, size).await;
+    }
+
+    async fn dir_names(storage: &Storage) -> Vec<String> {
+        let dir = engine::find_fill_dir(storage, DIR)
+            .await
+            .expect("lookup")
+            .expect("fill dir");
+        let mut names: Vec<String> = storage
+            .list_objects(Some(dir.handle))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|o| o.filename)
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn a_fill_reclaims_debris_a_killed_run_left_and_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let device = open(tmp.path()).await;
+        let mut storage = storage_of(&device).await;
+        strand_debris(&storage, "NEWF4A3.tmp", 4 * MIB).await;
+
+        let mut reclaimed = Vec::new();
+        engine::fill(&mut storage, window(), DIR, |event| {
+            if let engine::Event::Deleted {
+                name,
+                bytes,
+                kind: engine::DeletedKind::Interrupted,
+            } = event
+            {
+                reclaimed.push((name, bytes));
+            }
+        })
+        .await
+        .expect("fill");
+
+        assert_eq!(
+            reclaimed,
+            vec![("NEWF4A3.tmp".to_string(), 4 * MIB)],
+            "the reclaim has to be announced, not absorbed silently into the fill"
+        );
+        let names = dir_names(&storage).await;
+        assert!(
+            !names.iter().any(|n| n == "NEWF4A3.tmp"),
+            "debris survived the fill: {names:?}"
+        );
+    }
+
+    /// The safety half, and the reason this is a marker rather than a name pattern: with
+    /// no evidence that a run was interrupted, an unrecognised file is the user's.
+    #[tokio::test]
+    async fn without_the_marker_an_unrecognised_file_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let device = open(tmp.path()).await;
+        let mut storage = storage_of(&device).await;
+        let dir = storage
+            .create_folder(None, DIR)
+            .await
+            .expect("create fill dir");
+        // Same shape of name as real debris. The only thing absent is our own record
+        // that a fill was underway, and that alone must be enough to spare it.
+        put(&storage, dir, "NEWF4A3.tmp", 4 * MIB).await;
+
+        let mut reclaimed = 0;
+        engine::fill(&mut storage, window(), DIR, |event| {
+            if matches!(
+                event,
+                engine::Event::Deleted {
+                    kind: engine::DeletedKind::Interrupted,
+                    ..
+                }
+            ) {
+                reclaimed += 1;
+            }
+        })
+        .await
+        .expect("fill");
+
+        assert_eq!(reclaimed, 0);
+        assert!(
+            dir_names(&storage).await.iter().any(|n| n == "NEWF4A3.tmp"),
+            "a file we cannot prove is ours must survive a fill"
+        );
+    }
+
+    /// A reclaim that succeeds takes the marker with it — the other half of
+    /// `the_marker_outlives_a_reclaim_that_did_not_happen`, and the reason that one
+    /// cannot be satisfied by simply never removing the marker.
+    #[tokio::test]
+    async fn a_successful_reclaim_takes_the_marker_with_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let device = open(tmp.path()).await;
+        let mut storage = storage_of(&device).await;
+        strand_debris(&storage, "NEW1B83.tmp", 4 * MIB).await;
+
+        engine::fill(&mut storage, window(), DIR, |_| {})
+            .await
+            .expect("fill");
+
+        let names = dir_names(&storage).await;
+        assert!(
+            !names.iter().any(|n| engine::is_inflight_marker(n)),
+            "debris was reclaimed, so the marker had nothing left to account for: {names:?}"
+        );
+        assert!(!names.iter().any(|n| n == "NEW1B83.tmp"));
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_fill_leaves_no_marker_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let device = open(tmp.path()).await;
+        let mut storage = storage_of(&device).await;
+
+        engine::fill(&mut storage, window(), DIR, |_| {})
+            .await
+            .expect("fill");
+
+        let names = dir_names(&storage).await;
+        assert!(
+            !names.iter().any(|n| engine::is_inflight_marker(n)),
+            "a completed fill left its marker: {names:?} — the next run would hunt for \
+             debris that does not exist"
+        );
+    }
+
+    /// `clean` must never take the marker without the debris.
+    ///
+    /// Guarding a mistake that was briefly in this file: `clean` removed the marker,
+    /// because it is ours by name and the folder could not otherwise be removed as
+    /// empty — and left the debris, because that is not ours by name. Which destroys the
+    /// only evidence that would ever have let anything reclaim it. The space would then
+    /// have survived every `fill` and every `clean` for the life of the device.
+    #[tokio::test]
+    async fn clean_reclaims_the_debris_rather_than_orphaning_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let device = open(tmp.path()).await;
+        let mut storage = storage_of(&device).await;
+        strand_debris(&storage, "NEWF820.tmp", 4 * MIB).await;
+
+        let mut reclaimed = Vec::new();
+        let report = engine::clean(&mut storage, DIR, |event| {
+            if let engine::Event::Deleted {
+                name,
+                bytes,
+                kind: engine::DeletedKind::Interrupted,
+            } = event
+            {
+                reclaimed.push((name, bytes));
+            }
+        })
+        .await
+        .expect("clean");
+
+        assert_eq!(reclaimed, vec![("NEWF820.tmp".to_string(), 4 * MIB)]);
+        assert_eq!(
+            report.bytes,
+            4 * MIB,
+            "reclaimed bytes have to reach the report, or clean still says it freed \
+             nothing while freeing 4 MiB"
+        );
+        assert!(
+            !root_names(&storage).await.iter().any(|n| n == DIR),
+            "with nothing left in it, the folder should have gone too"
+        );
+    }
+
+    /// The marker lives in the folder it describes, which is also the folder whose
+    /// unexpected contents hold Fill behind an Overwrite tick. It must not count.
+    #[tokio::test]
+    async fn the_marker_is_never_reported_as_someone_elses_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let device = open(tmp.path()).await;
+        let storage = storage_of(&device).await;
+        let dir = storage
+            .create_folder(None, DIR)
+            .await
+            .expect("create fill dir");
+        put(&storage, dir, engine::INFLIGHT_MARKER, 1).await;
+
+        let foreign = engine::list_foreign(&storage, dir).await.expect("foreign");
+        assert!(
+            foreign.is_empty(),
+            "the marker read as foreign content: {:?}",
+            foreign.iter().map(|o| &o.filename).collect::<Vec<_>>()
+        );
+        assert!(
+            engine::overwrite_token(DIR, &foreign).is_none(),
+            "a folder holding only our own marker must need no confirmation"
+        );
+    }
+}
+
 async fn put(storage: &Storage, parent: ObjectHandle, name: &str, size: u64) {
     storage
         .upload(

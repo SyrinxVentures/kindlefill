@@ -135,6 +135,8 @@ crates/kindlefill-core/    plan.rs        pure convergence logic, no I/O
                           rate.rs        throughput smoothing, ETA, progress figures
                           zeros.rs       synthetic byte source for uploads
                           engine.rs      drives a real mtp_rs::Storage
+                          mass_storage.rs  the same fill over an OS-mounted volume
+                          wpd.rs         "is a portable device present?" on Windows
                           ptpcamerad.rs  keeps Apple's camera daemon off the device
 crates/kindlefill-cli/     probe / bench / status / fill / clean / purge
 crates/kindlefill-app/     Tauri desktop UI (static HTML frontend, no build step)
@@ -152,6 +154,21 @@ the convergence loop is exercised for real, per-file overhead included.
 That suite can't prove a Kindle refreshes free space promptly — a device that cached it
 would pass every test here and hang on the cable. That's what `bench` is for, and on a
 Paperwhite Signature Edition it came back exact.
+
+It also can't see anything the *backend* does differently, and on Windows that turned
+out to be most of what mattered. The virtual device speaks PTP-over-USB; a Kindle on
+Windows is reached through WPD, and the first time one was put on the cable it produced
+five bugs a green CI had no way to catch. Three were disagreements between the two
+backends about the same call — addressing the storage root by sentinel handle works on
+PTP and fails on WPD; a written object carries the name you asked for on PTP and a
+driver-chosen temporary name on WPD until it commits; and a delete that the device
+refuses reports as a success on WPD because the per-object result codes go unread.
+
+The pattern is worth naming, because it will recur: a test suite that exercises one
+transport proves the *engine*, not the tool. Anything expressed as "the library will do
+X" is unproven until a device has been asked. Where an assumption of that shape survives
+in this codebase, it now carries a comment saying which device, on which transport, was
+asked.
 
 ```bash
 cargo test      # no hardware required

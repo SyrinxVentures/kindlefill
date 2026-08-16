@@ -77,6 +77,35 @@ pub fn is_disconnected(error: &mtp_rs::Error) -> bool {
     )
 }
 
+/// Does this device's own reported identity say "Kindle"?
+///
+/// Asked because opening a device and *being on the right device* are different
+/// questions on Windows, and only one of them was being asked. `open_first` takes the
+/// first device the WPD manager enumerates, with no filter — and Windows publishes a
+/// WPD entry for every USB mass-storage volume, not just for media players. A 10th-gen
+/// Oasis proves the mechanism: it appears as `SWD\WPDBUSENUM\_??_USBSTOR#DISK&VEN_
+/// KINDLE&PROD_INTERNAL_STORAGE`, a generic shim over a USBSTOR disk whose only
+/// Kindle-specific part is the vendor string inside it. A USB stick or SD card in the
+/// same machine gets the same treatment and can be enumerated first, so without this
+/// the tool would happily report a flash drive's capacity and write filler onto it.
+///
+/// Matched on the strings the device volunteers, because that is the evidence both
+/// transports actually have: this Oasis reports manufacturer `Kindle` and model
+/// `Internal Storage`, while a native-MTP Kindle reports `Amazon`. Substring rather
+/// than equality — the two real devices already disagree on which field carries the
+/// word, and neither spelling is promised by any specification.
+///
+/// Deliberately a *heuristic with an escape hatch* rather than a hard gate. It is used
+/// to decide whether the user has to opt in before filling, not to decide whether the
+/// device may be used at all: a false negative on some unseen model must cost a
+/// checkbox, not the whole tool. The mass-storage transport does not need this — a
+/// volume named `Kindle` holding a `documents` folder has already answered it.
+#[must_use]
+pub fn looks_like_kindle(manufacturer: &str, model: &str) -> bool {
+    let haystack = format!("{manufacturer} {model}").to_lowercase();
+    haystack.contains("kindle") || haystack.contains("amazon")
+}
+
 /// Human-readable byte size, sized to how people talk about Kindle storage.
 #[must_use]
 pub fn human_bytes(bytes: u64) -> String {
@@ -92,6 +121,30 @@ pub fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_two_devices_this_has_actually_run_against_are_recognised() {
+        // Exactly as each reports itself: the Oasis carries the word in the
+        // manufacturer field with a model that says nothing, which is why neither
+        // field alone can be the one that's checked.
+        assert!(looks_like_kindle("Kindle", "Internal Storage"));
+        assert!(looks_like_kindle("Amazon", "Kindle"));
+    }
+
+    #[test]
+    fn a_usb_stick_enumerated_first_is_not_mistaken_for_a_kindle() {
+        // The failure this exists to stop: WPD publishes an entry for any mass-storage
+        // volume, and whichever Windows returns first is what `open_first` opens.
+        assert!(!looks_like_kindle("SanDisk", "Cruzer Blade"));
+        assert!(!looks_like_kindle("Generic", "USB Flash Disk"));
+        assert!(!looks_like_kindle("", ""));
+    }
+
+    #[test]
+    fn recognition_does_not_depend_on_how_the_device_capitalises_itself() {
+        assert!(looks_like_kindle("AMAZON", "KINDLE PAPERWHITE"));
+        assert!(looks_like_kindle("amazon", "kindle"));
+    }
 
     #[test]
     fn human_bytes_picks_a_sensible_unit() {

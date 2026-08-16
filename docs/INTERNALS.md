@@ -122,9 +122,8 @@ one that put those fixes in front of a Mac for the first time:
 | Stop, mid-object | Reported as "basically immediate" by the operator — impression, not instrumented; "What's written is intact — Fill again to resume" |
 | Resumed fill | Named what it continued from and scoped the bar to what was left |
 
-Three caveats attach to that run and should not be lost. **The device was jailbroken**
-(Vera, KOReader installed), so a stock Paperwhite on macOS is inferred rather than
-tested. **`kindlefill_inflight.txt` was never directly observed** — its consequences held
+Two caveats attach to that run and should not be lost.
+**`kindlefill_inflight.txt` was never directly observed** — its consequences held
 across normal exit, Stop and two `kill -9` runs, but the CLI has no verb that lists a
 folder, so the file's existence is inferred from behaviour. And **the CLI's `explain()`
 misdiagnoses a wedged device on macOS**: after a `kill -9` the Paperwhite answers reads
@@ -234,14 +233,15 @@ shouldn't be read as if it does.
 
 Fill, Stop, resume, and Remove filler & folder have all been run against a Paperwhite Signature
 Edition over MTP and an Oasis (10th generation) as a mass-storage volume (see Status), so
-both transports have carried a real fill and a real cleanup. Three paths have not, and are
+both transports have carried a real fill and a real cleanup. Two paths have not, and are
 covered only by the test suite:
 
 - **`ptpcamerad` taming** — the daemon wasn't running on the test machine. It is an MTP
   concern by construction: the mass-storage path opens no MTP session, so the Oasis run
   couldn't exercise it either.
-- **Deleting a staged firmware update** — no update was staged on either device.
 - **Overwrite** — neither test folder ever held foreign content.
+
+Deleting a staged firmware update **has** been exercised on hardware, on both platforms.
 
 That caveat used to extend to *when* those runs happened — the original Paperwhite runs
 predated the interface rework, so the reworked UI had never been driven over MTP against

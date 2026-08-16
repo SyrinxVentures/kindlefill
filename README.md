@@ -144,13 +144,7 @@ device on either platform, landing at **81.18 MB** on the first pass with the la
 stepping 1 GB → 256 MB → 16 MB, no overshoot below the window and no oscillation
 around it.
 
-Three things did not come out clean, and they are worth more than the passes.
-
-**The test device was jailbroken** — Vera, with KOReader installed. Nothing in the
-results looked jailbreak-shaped; the MTP responder is Amazon's own and the device
-behaved as the stock Paperwhite did on Windows. But a stock Paperwhite on macOS is
-inferred from that, not tested, and the difference is exactly the kind this section
-exists to keep visible.
+Two things did not come out clean, and they are worth more than the passes.
 
 **The marker file was never directly observed.** `kindlefill_inflight.txt` behaved
 correctly in every way that can be seen from outside: after a normal fill, `status`

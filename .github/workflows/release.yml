@@ -143,10 +143,14 @@ jobs:
           body: |
             ## Install
 
-            Download the `.dmg` below, open it, and drag KindleFill to Applications.
-            **Apple silicon only.**
+            **macOS** — download the `.dmg`, open it, and drag KindleFill to
+            Applications. **Apple silicon only.** Signed and notarized by Syrinx
+            Ventures, so it opens on a double-click.
 
-            Signed and notarized by Syrinx Ventures, so it opens on a double-click.
+            **Windows** — download the `_x64-setup.exe` and run it. The installer is
+            **unsigned**, so SmartScreen will warn on first run: click **More info** →
+            **Run anyway**. On a machine without the WebView2 runtime the installer
+            downloads it, so that first install needs a network connection.
 
             ---
 
@@ -162,6 +166,13 @@ jobs:
           generate_release_notes: true
           body: |
             ## Install
+
+            **Windows** — download the `_x64-setup.exe` and run it. The installer is
+            **unsigned**, so SmartScreen will warn on first run: click **More info** →
+            **Run anyway**. On a machine without the WebView2 runtime the installer
+            downloads it, so that first install needs a network connection.
+
+            ## Install (macOS)
 
             Download the `.dmg` below, open it, and drag KindleFill to Applications.
             **Apple silicon only.**
@@ -183,3 +194,58 @@ jobs:
 
             *Not created or endorsed by Amazon. Kindle and Amazon are trademarks of
             Amazon.com, Inc. or its affiliates.*
+
+  installer:
+    # Windows is the platform 1.0.1 was validated on, and until this job existed a tag
+    # published a macOS-only release — nothing to download for the platform the release
+    # notes described. The DMG job is where the draft and its notes come from, so this
+    # only adds a file to it.
+    #
+    # `needs: dmg` couples the two deliberately. Running them in parallel would have both
+    # racing to create the same draft, and a half-published release is worse than a late
+    # one: the coupling means either both artifacts arrive or neither does, rather than
+    # Windows users finding a release whose macOS half silently failed.
+    needs: dmg
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      # Run again here rather than trusting the macOS job's pass. These are not the same
+      # gates on a different machine — `clippy` and the test suite compile the
+      # `cfg(windows)` code that no other runner touches, which is where the WPD device
+      # probe, the drive-letter volume search and the Windows error wording live. This
+      # repo has already shipped a Windows test suite that had never once run.
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+      - name: Install the Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      # Produces target/release/bundle/nsis/KindleFill_<version>_x64-setup.exe. The
+      # version comes from the workspace Cargo.toml — `tauri.conf.json` deliberately
+      # declares none — so this filename and the DMG's cannot disagree about the release
+      # they belong to.
+      - name: Build the NSIS installer
+        working-directory: crates/kindlefill-app
+        run: cargo tauri build
+
+      # The bundler is the only thing that knows the exact filename, so check one landed
+      # rather than discovering an empty upload in the draft.
+      - name: Verify the installer exists
+        shell: bash
+        run: |
+          ls -l target/release/bundle/nsis/*_x64-setup.exe
+
+      # Same tag, so this attaches to the draft the DMG job created. No `body` and no
+      # `generate_release_notes` here on purpose: passing either would overwrite the
+      # notes that job wrote, and the Windows instructions are already in them.
+      - name: Add the installer to the draft
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: target/release/bundle/nsis/*_x64-setup.exe

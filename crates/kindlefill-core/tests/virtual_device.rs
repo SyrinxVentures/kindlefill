@@ -667,6 +667,69 @@ mod interrupted_writes {
     }
 }
 
+/// A resumed fill has to say so.
+///
+/// The progress figures cannot: `total` is recomputed each run as the distance still to
+/// travel, so a resume reports 0% of a smaller number and the bar leaves from the left
+/// exactly as a fresh fill does. Watching that happen after a Stop is indistinguishable
+/// from watching the previous run's gigabytes be thrown away, and the first person to
+/// see it on real hardware reasonably assumed they had been.
+#[tokio::test]
+async fn a_resumed_fill_reports_what_it_is_keeping() {
+    let tmp = tempfile::tempdir().unwrap();
+    let device = open(tmp.path()).await;
+    let mut storage = storage_of(&device).await;
+    let w = window();
+
+    engine::fill(&mut storage, w, DIR, |_| {})
+        .await
+        .expect("first fill");
+    let dir = engine::find_fill_dir(&storage, DIR).await.unwrap().unwrap();
+    let first = engine::list_fillers(&storage, dir.handle).await.unwrap();
+    // Take one away so the second run has work to do and something to keep.
+    storage
+        .delete(first.last().expect("a filler").handle)
+        .await
+        .expect("delete");
+
+    let mut resumed = None;
+    engine::fill(&mut storage, w, DIR, |event| {
+        if let engine::Event::Resuming { files, bytes } = event {
+            resumed = Some((files, bytes));
+        }
+    })
+    .await
+    .expect("second fill");
+
+    let kept = first.len() - 1;
+    let kept_bytes: u64 = first.iter().take(kept).map(|f| f.size).sum();
+    assert_eq!(
+        resumed,
+        Some((kept, kept_bytes)),
+        "a resume has to name what it kept, or nothing on screen distinguishes it from \
+         starting over"
+    );
+}
+
+/// The other half: a fill with nothing to continue from must not claim it is resuming.
+#[tokio::test]
+async fn a_first_fill_does_not_claim_to_be_resuming() {
+    let tmp = tempfile::tempdir().unwrap();
+    let device = open(tmp.path()).await;
+    let mut storage = storage_of(&device).await;
+
+    let mut claimed = false;
+    engine::fill(&mut storage, window(), DIR, |event| {
+        if matches!(event, engine::Event::Resuming { .. }) {
+            claimed = true;
+        }
+    })
+    .await
+    .expect("fill");
+
+    assert!(!claimed, "there was nothing on the device to resume from");
+}
+
 async fn put(storage: &Storage, parent: ObjectHandle, name: &str, size: u64) {
     storage
         .upload(

@@ -455,6 +455,8 @@ fn forward(app: &AppHandle, event: Event) {
         // Nothing left the device, so nothing may move the tally. The whole point of
         // this event is that the optimistic accounting was wrong.
         Event::DeleteRefused { .. } => {}
+        // Describes what is already counted, not a change to it.
+        Event::Resuming { .. } => {}
         Event::Finished { free } => device_update(app, Some(*free), 0, 0),
         Event::Progress(_) => {}
     }
@@ -487,6 +489,18 @@ fn forward(app: &AppHandle, event: Event) {
                 },
             );
         }
+        // Directly under "Starting at…", which is where the doubt lands: that line and
+        // a bar leaving from zero otherwise look exactly like a fill that discarded
+        // everything the previous run wrote.
+        Event::Resuming { files, bytes } => log(
+            app,
+            format!(
+                "Resuming — {} of filler is already on the device ({files} file{}), and \
+                 is being kept. The bar below measures only what is left to write.",
+                human_bytes(bytes),
+                if files == 1 { "" } else { "s" }
+            ),
+        ),
         Event::Wrote { name, bytes, free } => log(
             app,
             format!(

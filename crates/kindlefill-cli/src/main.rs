@@ -501,6 +501,11 @@ async fn fill(low: u64, high: u64, dir_name: &str, overwrite: bool) -> Result<()
                 human_bytes(aim),
                 human_bytes(total)
             ),
+            Event::Resuming { files, bytes } => println!(
+                "  resuming — {} of filler already on the device ({files} file{})",
+                human_bytes(bytes),
+                if files == 1 { "" } else { "s" }
+            ),
             Event::Progress(p) => {
                 render_progress(&p, tty);
                 drew_bar = true;

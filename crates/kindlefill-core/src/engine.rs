@@ -95,6 +95,13 @@ pub enum Event {
     /// Throughput and ETA, emitted during uploads at most every
     /// [`PROGRESS_INTERVAL`].
     Progress(FillProgress),
+    /// The fill folder already held filler, and this run is continuing from it.
+    ///
+    /// Emitted only when there is something to continue from, so its presence is the
+    /// answer to "did it keep what I already wrote?" — a question the progress bar
+    /// cannot answer, because it measures the run rather than the goal and therefore
+    /// starts from the left either way.
+    Resuming { files: usize, bytes: u64 },
     /// One filler object landed. `free` is the freshly re-read value.
     Wrote { name: String, bytes: u64, free: u64 },
     /// One object was removed. See [`DeletedKind`] — a consumer keeping a filler tally
@@ -937,6 +944,19 @@ where
     target.mark_inflight().await?;
 
     let existing = target.fillers().await?;
+    // Say out loud that this is a continuation, because nothing else does. `total` is
+    // recomputed every run as the distance still to travel, so a resumed fill reports
+    // 0% of a smaller number and the bar starts from the left exactly as a fresh fill
+    // does — honest arithmetic that reads, to anyone watching, as having thrown the
+    // previous run's work away. This is the one line that distinguishes the two, and it
+    // costs nothing: the listing it reports was already fetched to pick the next
+    // sequence number.
+    if !existing.is_empty() {
+        on_event(Event::Resuming {
+            files: existing.len(),
+            bytes: existing.iter().map(|f| f.bytes).sum(),
+        });
+    }
     let mut seq = next_sequence(existing.iter().map(|f| f.name.as_str()));
     let mut rate = RateEstimator::new();
     // One clock for the whole job. The rate window spans object boundaries, so it

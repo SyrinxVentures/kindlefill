@@ -9,7 +9,7 @@ resolver = "2"
 # what they are. Two declarations is one more than can be kept in step by hand, and the
 # failure is silent: a macOS build and a Windows build of the same commit calling
 # themselves different versions.
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 # Matches mtp-rs and the Rust ecosystem default. Apache-2.0 carries the explicit
 # patent grant; MIT is the shorter, more universally recognized option. Downstream

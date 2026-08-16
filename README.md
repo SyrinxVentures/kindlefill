@@ -17,15 +17,17 @@ remaining.](docs/screenshot.png)
 
 ## Install
 
-Download the latest **KindleFill_*_aarch64.dmg** from
-[Releases](https://github.com/SyrinxVentures/kindlefill/releases/latest), open it, and
-drag KindleFill to Applications. Apple silicon only — see [Platforms](#platforms).
+From [Releases](https://github.com/SyrinxVentures/kindlefill/releases/latest):
 
-Released builds are signed with a Developer ID and notarized by Apple, so they open on a
-double-click with no warning to dismiss.
+- **macOS** — **KindleFill_*_aarch64.dmg**. Open it and drag KindleFill to Applications.
+  Apple silicon only. Signed with a Developer ID and notarized by Apple, so it opens on a
+  double-click with no warning to dismiss.
+- **Windows** — **KindleFill_*_x64-setup.exe**. The installer is unsigned, so SmartScreen
+  warns on first run: **More info** → **Run anyway**. On a machine without the WebView2
+  runtime the installer fetches it, so that first install needs a network connection.
 
-Windows builds are not published yet — build from source, or see
-[Platforms](#platforms).
+Both are built from the same commit and carry the same version — see
+[Platforms](#platforms) for what has actually been tested on each.
 
 Also turn on **Airplane Mode**. Filling the storage stops the download; Airplane Mode
 stops the check.
@@ -117,7 +119,7 @@ Finder volume.
 That validation was against **0.2.0**. Every fix below is in shared code, most of it in
 the engine both platforms run, and none of it has been put in front of a Mac. The tests
 pass and the changes are the more tolerant spelling on the PTP path macOS uses, but
-"should be fine" is exactly the claim this section exists to stop making. Until 1.0.0 has
+"should be fine" is exactly the claim this section exists to stop making. Until 1.0.1 has
 been run against a Kindle on a Mac, treat the macOS builds as carrying the same
 unverified-on-hardware status Windows used to.
 
@@ -128,8 +130,9 @@ operation on Windows. The app and CLI binaries shared one case-insensitive path 
 `target/` and silently overwrote each other. The pre-flight estimate quoted a throughput
 measured on other hardware, advertising four minutes for a transfer that took twenty-six.
 A failed detect left the presence poll re-announcing a reconnect every two seconds
-forever. And the activity log resized itself as lines arrived, moving the panel above it
-under the reader's eyes.
+forever. The activity log resized itself as lines arrived, moving the panel above it
+under the reader's eyes. And a resumed fill was indistinguishable on screen from one
+that had thrown the previous run's work away.
 
 The last two are worth their own paragraph, because they concern what the tool *claims*
 rather than what it does.
